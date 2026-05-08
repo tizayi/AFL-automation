@@ -32,6 +32,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         "p300_single": "300ul",
         "p1000_single": "1000ul",
     }
+    # Addressable area used when dropping tips. Subclasses may override.
+    TRASH_ADDRESSABLE_AREA = "fixedTrash"
     defaults = {}
     defaults["robot_ip"] = "127.0.0.1"  # Default to localhost, should be overridden
     defaults["robot_port"] = "31950"  # Default Opentrons HTTP API port
@@ -811,7 +813,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # we need to load into a module, not a slot
                 location = {"moduleId": self.config["loaded_modules"][str(slot)][0]}
             else:
-                location = {"slotName": str(slot)}
+                location = {"slotName": self._api_slot_name(slot)}
                 
             # Prepare the loadLabware command
             command_dict = {
@@ -910,7 +912,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "data": {
                     "commandType": "loadModule",
                     "params": {
-                        "location": {"slotName": str(slot)},
+                        "location": {"slotName": self._api_slot_name(slot)},
                         "model": name,
                     },
                     "intent": "setup",
@@ -1096,6 +1098,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         key = str(name).strip().lower()
         normalized = self.PIPETTE_NAME_ALIASES.get(key, key)
         return normalized
+
+    def _api_slot_name(self, slot):
+        """Return the slot name to pass to the HTTP API. Override in subclasses for robots with different slot naming."""
+        return str(slot)
 
     def _warn_on_tiprack_mismatch(self, pipette_name, tip_rack_slots):
         token = self.EXPECTED_TIPRACK_TOKEN.get(pipette_name)
@@ -1450,7 +1456,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "moveToAddressableAreaForDropTip",
                     {
                         "pipetteId": tip_pipette_id,
-                        "addressableAreaName": "fixedTrash",
+                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
                         "offset": {"x": 0, "y": 0, "z": 10},
                         "alternateDropLocation": False,
                     },
@@ -1470,7 +1476,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "moveToAddressableAreaForDropTip",
                     {
                         "pipetteId": tip_pipette_id,
-                        "addressableAreaName": "fixedTrash",
+                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
                         "offset": {"x": 0, "y": 0, "z": 10},
                         "alternateDropLocation": False,
                     },
@@ -1741,7 +1747,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # in it: Opentrons incompetence
                 self._execute_atomic_command("moveToAddressableAreaForDropTip", {
                         "pipetteId": pipette_id,
-                        "addressableAreaName": "fixedTrash",
+                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
                         "offset": {
                             "x": 0,
                             "y": 0,
@@ -2210,7 +2216,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             self.run_id = run_response.json()["data"]["id"]
             self.log_debug(f"Created run: {self.run_id}")
-            
+
+            # Hook for subclasses to perform additional setup before deck reload
+            self._after_run_created(self.run_id)
+
             # Reload previously configured labware, instruments, and modules
             self._reload_deck_configuration()
             
@@ -2318,6 +2327,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.config["loaded_instruments"] = original_instruments
             return False
     
+    def _after_run_created(self, run_id):
+        """Called after a new run is created, before the deck state is reloaded.
+        Override in subclasses to perform additional per-run setup."""
+        pass
+
     def _ensure_run_exists(self, check_run_status=True):
         """Ensure a run exists for executing commands, creating one if needed
         

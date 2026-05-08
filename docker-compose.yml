@@ -66,5 +66,24 @@ services:
       - ./docker/config/instrument-config.json:/root/.afl/config.json:ro
     command: ["python", "-m", "AFL.automation.instrument.BioSANS"]
 
+  flex:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.flex
+    ports:
+      - "5003:5003"
+    environment:
+      - AFL_FLEX_PORT=5003
+      - TILED_SERVER=http://tiled:8000
+      - TILED_API_KEY=devkey
+      - FLEX_ROBOT_IP=${FLEX_ROBOT_IP:-192.168.1.100}
+    depends_on:
+      - tiled
+    volumes:
+      - ./docker/config/flex-config.json:/root/.afl/config.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["python", "-m", "AFL.automation.prepare.FlexPrepare"]
+
 volumes:
   tiled-data:

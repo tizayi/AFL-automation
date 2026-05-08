@@ -1,0 +1,168 @@
+{% if mode == 'full' %}
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+{{ inline_css|safe }}
+</style>
+</head>
+<body>
+<div class="deck-container">
+<div class="deck-title">Opentrons Flex Deck Layout</div>
+<div class="legend">
+  <div class="legend-item"><div class="legend-color" style="background:#4caf50;"></div><span>Available Tips</span></div>
+  <div class="legend-item"><div class="legend-color" style="background:#f44336;"></div><span>Used Tips</span></div>
+  <div class="legend-item"><div class="legend-color" style="background:#42a5f5;"></div><span>Plate Wells</span></div>
+  <div class="legend-item"><div class="legend-color" style="background:#66bb6a;"></div><span>Reservoir</span></div>
+  <div class="legend-item"><div class="legend-color" style="background:#e1bee7;"></div><span>Module</span></div>
+  <div class="legend-item"><div class="legend-color" style="background:#ffcdd2;"></div><span>Trash / Waste</span></div>
+</div>
+
+{# --- Main 4×3 deck grid ------------------------------------------------ #}
+<div style="display:flex; gap:12px; justify-content:center; align-items:flex-start;">
+
+  {# Row labels (A–D) on the left #}
+  <div class="row-labels">
+    <div class="row-label-item" title="Back of robot">A</div>
+    <div class="row-label-item">B</div>
+    <div class="row-label-item">C</div>
+    <div class="row-label-item" title="Front of robot">D</div>
+  </div>
+
+  {# Main 3-column grid #}
+  <div>
+    <div class="col-labels"><div class="col-label-item">1</div><div class="col-label-item">2</div><div class="col-label-item">3</div></div>
+    <div class="deck-grid">
+    {% for row in slot_layout %}
+      {% for slot in row %}
+        {% set info = slot_infos[slot|string] %}
+        <div class='deck-slot{% if info.type == "trash" %} trash-slot{% endif %}' {{ info.click_attr|safe }}>
+          <div class='slot-number'>{{ info.slot_label }}</div>
+          <div class='slot-content'>{{ info.name|safe }}</div>
+          <div class='well-layout'>{{ info.svg|safe }}</div>
+          <div class='slot-details'>{{ info.buttons|safe }}</div>
+        </div>
+      {% endfor %}
+    {% endfor %}
+    </div>
+  </div>
+
+  {# Staging column (A4–D4) — only shown when enabled #}
+  {% if staging_slots %}
+  <div class="staging-column">
+    <div class="staging-title">Staging</div>
+    {% for slot in staging_slots %}
+      {% set info = slot_infos[slot] %}
+      <div class='deck-slot staging-slot{% if info.type == "trash" %} trash-slot{% endif %}' {{ info.click_attr|safe }}>
+        <div class='slot-number'>{{ info.slot_label }}</div>
+        <div class='slot-content'>{{ info.name|safe }}</div>
+        <div class='well-layout'>{{ info.svg|safe }}</div>
+        <div class='slot-details'>{{ info.buttons|safe }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+</div>{# end flex wrapper #}
+
+{# --- Pipettes section -------------------------------------------------- #}
+{% if loaded_instruments %}
+<div class='pipettes-section'>
+  <div class='pipettes-title'>Loaded Pipettes</div>
+  {% for mount, data in loaded_instruments.items() %}
+  <div class='pipette-item'>
+    <strong>{{ mount|title }} Mount:</strong> {{ data.name.replace('_',' ').title() }}
+    <button style='font-size:10px;' onclick="resetTipracks('{{ mount }}')">Reset Tips</button>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{# --- Gripper section --------------------------------------------------- #}
+{% if gripper_info %}
+<div class='pipettes-section gripper-section'>
+  <div class='pipettes-title'>Gripper</div>
+  <div class='pipette-item'>
+    <strong>Serial:</strong> {{ gripper_info.serial }}
+    &nbsp;|&nbsp; <strong>Run ID:</strong> {{ gripper_info.gripper_id }}
+  </div>
+</div>
+{% else %}
+<div class='pipettes-section gripper-section'>
+  <div class='pipettes-title'>Gripper</div>
+  <div class='pipette-item' style='color:#888;'>
+    No gripper loaded.
+    <button style='font-size:10px;' onclick="loadGripper()">Load Gripper</button>
+  </div>
+</div>
+{% endif %}
+
+{# --- Load instrument / deck reset controls ----------------------------- #}
+<div style="margin-top:30px; display:flex; flex-direction:column; align-items:center; gap:20px;">
+  <div style="background:#f5f5f5; border-radius:8px; padding:16px 24px; box-shadow:0 2px 8px rgba(0,0,0,0.05); display:inline-block;">
+    <label><b>Mount:</b>
+      <select id="mount-select">
+        <option value="left">Left</option>
+        <option value="right">Right</option>
+      </select>
+    </label>
+    &nbsp;
+    <label><b>Pipette:</b>
+      <select id="pipette-select">
+        <option value="flex_1channel_50">Flex 1-ch 50 µL</option>
+        <option value="flex_1channel_1000">Flex 1-ch 1000 µL</option>
+        <option value="flex_8channel_50">Flex 8-ch 50 µL</option>
+        <option value="flex_8channel_1000">Flex 8-ch 1000 µL</option>
+        <option value="flex_96channel_1000">Flex 96-ch 1000 µL</option>
+      </select>
+    </label>
+    &nbsp;
+    <label><b>Tiprack Slots:</b>
+      <input id="tiprack-slots" type="text" placeholder="e.g. 1,2,4" style="width:90px;"/>
+    </label>
+    &nbsp;
+    <button id="load-instrument-btn" style="font-weight:bold;">Load Instrument</button>
+  </div>
+  <button id="reset-deck-btn" style="margin-top:10px; background:#e53935; color:white; font-weight:bold; border:none; border-radius:6px; padding:10px 24px; font-size:15px; box-shadow:0 2px 6px rgba(0,0,0,0.08);">Reset Deck</button>
+</div>
+
+<script>
+window.OT2DeckData = {{ deck_data_json|safe }};
+</script>
+<link rel="stylesheet" href="/static/apps/common/jquery-ui/jquery-ui.min.css">
+<script src="/static/apps/common/jquery/jquery.min.js"></script>
+<script src="/static/apps/common/jquery-ui/jquery-ui.min.js"></script>
+<script>
+{{ inline_js|safe }}
+</script>
+</div>{# end deck-container #}
+</body>
+</html>
+
+{% else %}{# simple / compact mode #}
+
+<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; max-width: 650px; font-family: Arial, sans-serif;">
+{% for row in slot_layout %}
+  {% for slot in row %}
+    {% set info = slot_infos[slot|string] %}
+    <div {{ info.click_attr|safe }} style="background: {{ info.color }}; border: 1px solid #ccc; border-radius: 6px; padding: 8px; text-align: center; min-height: 100px; display: flex; flex-direction: column; justify-content: flex-start; align-items: center; position: relative; font-size: 11px;">
+      <div style="position: absolute; top: 2px; left: 4px; font-weight: bold; font-size: 10px; background: rgba(255,255,255,0.8); padding: 1px 3px; border-radius: 2px;">{{ info.slot_label }}</div>
+      <div style="margin: 12px 0 5px 0; font-weight: 500; line-height: 1.1;">{{ info.name|safe }}</div>
+      {{ info.svg|safe }}
+      {{ info.buttons|safe }}
+    </div>
+  {% endfor %}
+{% endfor %}
+</div>
+{% if loaded_instruments %}
+<div style='margin-top: 10px; padding: 8px; background: #f0f0f0; border-radius: 4px; font-size: 12px;'>
+  <strong>Pipettes:</strong>
+  {% for mount, data in loaded_instruments.items() %}
+    {{ mount|title }}: {{ data.name.replace('_',' ').title() }}
+    <button style='font-size:10px;' onclick="resetTipracks('{{ mount }}')">Reset Tips</button>
+    {% if not loop.last %} | {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{% endif %}

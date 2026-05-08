@@ -1,0 +1,262 @@
+/* Flex Deck Visualizer Styles */
+
+body {
+  font-family: Arial, sans-serif;
+  background: #f8f9fa;
+  margin: 0;
+  padding: 20px;
+}
+
+.deck-container {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.deck-title {
+  font-size: 24px;
+  font-weight: bold;
+  text-align: center;
+  margin-bottom: 18px;
+  color: #374151;
+  letter-spacing: 1px;
+}
+
+/* --- Legend ------------------------------------------------------------ */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+  justify-content: center;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  gap: 4px;
+}
+
+.legend-color {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  border: 1px solid #ccc;
+}
+
+/* --- Row / Column labels ----------------------------------------------- */
+.row-labels {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  justify-content: space-around;
+  padding-top: 28px;   /* align with first slot after col-labels */
+  padding-bottom: 4px;
+}
+
+.row-label-item {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: bold;
+  font-size: 16px;
+  color: #555;
+  min-height: 130px;
+}
+
+.col-labels {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.col-label-item {
+  text-align: center;
+  font-weight: bold;
+  font-size: 15px;
+  color: #555;
+}
+
+/* --- Main deck grid ---------------------------------------------------- */
+.deck-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+/* --- Staging column ---------------------------------------------------- */
+.staging-column {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 28px;
+}
+
+.staging-title {
+  font-size: 13px;
+  font-weight: bold;
+  text-align: center;
+  color: #6b7280;
+  margin-bottom: 2px;
+}
+
+/* --- Deck slots -------------------------------------------------------- */
+.deck-slot {
+  background: white;
+  border: 2px solid #d1d5db;
+  border-radius: 8px;
+  padding: 8px;
+  text-align: center;
+  min-height: 130px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: center;
+  position: relative;
+  font-size: 11px;
+  cursor: default;
+  transition: box-shadow 0.15s;
+}
+
+.deck-slot:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.staging-slot {
+  border-style: dashed;
+  border-color: #9ca3af;
+  background: #f9fafb;
+}
+
+.trash-slot {
+  background: #ffcdd2;
+  border-color: #e57373;
+}
+
+.slot-number {
+  position: absolute;
+  top: 3px;
+  left: 6px;
+  font-weight: bold;
+  font-size: 11px;
+  background: rgba(255, 255, 255, 0.85);
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #374151;
+}
+
+.slot-content {
+  margin: 18px 0 4px 0;
+  font-weight: 500;
+  line-height: 1.2;
+  min-height: 28px;
+  color: #1f2937;
+  word-break: break-word;
+}
+
+.well-layout {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.slot-details {
+  margin-top: 4px;
+}
+
+/* --- Pipettes section -------------------------------------------------- */
+.pipettes-section {
+  background: #f0f4f8;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 12px 20px;
+  margin-top: 18px;
+  display: inline-block;
+  min-width: 320px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+
+.pipettes-title {
+  font-size: 14px;
+  font-weight: bold;
+  margin-bottom: 8px;
+  color: #374151;
+}
+
+.pipette-item {
+  font-size: 13px;
+  margin-bottom: 4px;
+  color: #374151;
+}
+
+/* --- Gripper section --------------------------------------------------- */
+.gripper-section {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+/* --- Well SVGs --------------------------------------------------------- */
+.well-svg circle {
+  fill: #42a5f5;
+  stroke: #1565c0;
+  stroke-width: 0.5;
+  transition: fill 0.1s;
+}
+
+.well-svg circle:hover {
+  fill: #1565c0;
+}
+
+.well-svg rect {
+  transition: fill 0.1s;
+}
+
+.well-svg rect:hover {
+  filter: brightness(0.85);
+}
+
+/* tip states */
+.well-svg circle.tip-available {
+  fill: #4caf50;
+  stroke: #2e7d32;
+}
+
+.well-svg circle.tip-used {
+  fill: #f44336;
+  stroke: #b71c1c;
+}
+
+/* --- Move-labware dialog ---------------------------------------------- */
+.move-warning {
+  color: #e57373;
+  font-size: 11px;
+  margin-top: 6px;
+  margin-bottom: 0;
+}
+
+/* --- jQuery UI dialog overrides --------------------------------------- */
+.ui-dialog-titlebar {
+  background: #374151 !important;
+  color: white !important;
+}
+
+.ui-dialog-titlebar-close {
+  color: white !important;
+}
+
+/* --- Responsive -------------------------------------------------------- */
+@media (max-width: 700px) {
+  .deck-grid {
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+  }
+  .deck-slot {
+    min-height: 90px;
+  }
+  .row-label-item {
+    min-height: 90px;
+  }
+}

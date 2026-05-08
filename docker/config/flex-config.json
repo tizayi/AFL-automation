@@ -1,0 +1,29 @@
+{
+  "26/16/01 11:00:00.000000": {
+    "owner_email": "",
+    "system_serial": "Default",
+    "tiled_server": "http://tiled:8000",
+    "tiled_api_key": "devkey",
+    "bind_address": "0.0.0.0",
+    "ports": {
+      "FlexPrepare": 5003
+    },
+    "driver_custom_configs": {
+      "FlexPrepare": {
+        "_classname": "AFL.automation.prepare.FlexPrepare.FlexPrepare",
+        "overrides": {
+          "robot_ip": "192.168.1.100",
+          "robot_port": "31950",
+          "deck_configuration": [
+            {"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"}
+          ],
+          "stocks": [],
+          "stock_mix_order": [],
+          "deck": {}
+        }
+      }
+    },
+    "ca_status_enabled": false,
+    "ca_status_ports": {}
+  }
+}
