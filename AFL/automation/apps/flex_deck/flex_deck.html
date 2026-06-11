@@ -49,7 +49,7 @@
 
   {# Staging column (A4–D4) — only shown when enabled #}
   {% if staging_slots %}
-  <div class="staging-column">
+  <div class="staging-column" id="staging-column">
     <div class="staging-title">Staging</div>
     {% for slot in staging_slots %}
       {% set info = slot_infos[slot] %}
@@ -58,6 +58,18 @@
         <div class='slot-content'>{{ info.name|safe }}</div>
         <div class='well-layout'>{{ info.svg|safe }}</div>
         <div class='slot-details'>{{ info.buttons|safe }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="staging-column" id="staging-column" style="display:none;">
+    <div class="staging-title">Staging</div>
+    {% for slot in ["A4","B4","C4","D4"] %}
+      <div class='deck-slot staging-slot'>
+        <div class='slot-number'>{{ slot }}</div>
+        <div class='slot-content'>Empty</div>
+        <div class='well-layout'></div>
+        <div class='slot-details'></div>
       </div>
     {% endfor %}
   </div>
@@ -124,10 +136,12 @@
     <button id="load-instrument-btn" style="font-weight:bold;">Load Instrument</button>
   </div>
   <button id="reset-deck-btn" style="margin-top:10px; background:#e53935; color:white; font-weight:bold; border:none; border-radius:6px; padding:10px 24px; font-size:15px; box-shadow:0 2px 6px rgba(0,0,0,0.08);">Reset Deck</button>
+  <button id="toggle-staging-btn" style="margin-top:10px; border:none; border-radius:6px; padding:10px 24px; font-size:15px; box-shadow:0 2px 6px rgba(0,0,0,0.08);">&#8942; Toggle Staging Area</button>
 </div>
 
 <script>
 window.OT2DeckData = {{ deck_data_json|safe }};
+window.OT2DeckData.stagingEnabled = {{ 'true' if staging_slots else 'false' }};
 </script>
 <link rel="stylesheet" href="/static/apps/common/jquery-ui/jquery-ui.min.css">
 <script src="/static/apps/common/jquery/jquery.min.js"></script>

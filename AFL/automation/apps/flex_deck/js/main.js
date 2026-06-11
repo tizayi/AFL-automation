@@ -263,4 +263,34 @@ $(document).ready(function() {
             });
         });
     });
+
+    // Staging area toggle — show/hide column and persist via set_staging_areas
+    var stagingEnabled = window.OT2DeckData && window.OT2DeckData.stagingEnabled;
+    var stagingCol = $('#staging-column');
+    var toggleBtn = $('#toggle-staging-btn');
+
+    function updateToggleBtn(enabled) {
+        toggleBtn.css({
+            background: enabled ? '#388e3c' : '#757575',
+            color: 'white',
+            fontWeight: 'bold'
+        }).text(enabled ? '\u25A3 Staging Area: ON' : '\u25A2 Staging Area: OFF');
+    }
+    updateToggleBtn(stagingEnabled);
+
+    toggleBtn.click(function() {
+        stagingEnabled = !stagingEnabled;
+        stagingCol.toggle(stagingEnabled);
+        updateToggleBtn(stagingEnabled);
+        var cutouts = stagingEnabled ? ['cutoutB3', 'cutoutC3', 'cutoutD3'] : [];
+        login().then(function(tok) {
+            $.ajax({
+                type: 'POST',
+                url: '/query_driver',
+                headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
+                data: JSON.stringify({task_name: 'set_staging_areas', cutouts: cutouts}),
+                error: function(xhr) { console.warn('set_staging_areas failed:', xhr.responseText); }
+            });
+        });
+    });
 });

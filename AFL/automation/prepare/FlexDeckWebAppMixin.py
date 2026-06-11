@@ -36,14 +36,6 @@ FLEX_LABWARE_OPTIONS = {
     "absorbanceReaderV1":                         "Absorbance Reader",
 }
 
-# Numeric-slot → Flex alphanumeric display label
-_SLOT_DISPLAY = {
-    "10": "A1", "11": "A2", "12": "A3",
-    "7":  "B1", "8":  "B2", "9":  "B3",
-    "4":  "C1", "5":  "C2", "6":  "C3",
-    "1":  "D1", "2":  "D2", "3":  "D3",
-}
-
 # Staging slots — enabled when the deck config includes a staging-area fixture.
 _STAGING_SLOTS = {
     "A4": "A4", "B4": "B4", "C4": "C4", "D4": "D4",
@@ -58,10 +50,10 @@ _STAGING_CUTOUT_IDS = {
     "stagingAreaLeftSlot",
 }
 
-# Static mapping from right-column cutout IDs to OT2-convention slot numbers.
-# Used to detect which slot holds a trash fixture.
+# Static mapping from right-column cutout IDs to Flex alphanumeric slot names.
+# Used to detect which slot holds a trash or waste-chute fixture.
 _TRASH_CUTOUTS = {
-    "cutoutA3": "12", "cutoutB3": "9", "cutoutC3": "6", "cutoutD3": "3",
+    "cutoutA3": "A3", "cutoutB3": "B3", "cutoutC3": "C3", "cutoutD3": "D3",
 }
 
 
@@ -87,9 +79,10 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
 
         Returns the same structure expected by the Jinja template.
         """
-        # Staging slots (A4–D4) are stored under their alphanumeric key
-        slot_str = str(slot_key)
-        display_label = _SLOT_DISPLAY.get(slot_str, slot_str)
+        # slot_key is already a Flex alphanumeric (e.g. "D1") or staging ("A4").
+        slot_str = str(slot_key).upper()
+        # slot_label == slot_str for Flex keys; kept for template compatibility.
+        display_label = slot_str
 
         info = {
             "name": "Empty",
@@ -107,8 +100,8 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             fixture = entry.get("cutoutFixtureId", "")
             cutout = entry.get("cutoutId", "")
             if "trash" in fixture.lower() or "wasteChute" in fixture.lower():
-                mapped = _TRASH_CUTOUTS.get(cutout)
-                if mapped == slot_str:
+                mapped_flex = _TRASH_CUTOUTS.get(cutout)
+                if mapped_flex == slot_str:
                     info.update({
                         "name": "Trash / Waste",
                         "type": "trash",
@@ -189,8 +182,9 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
                 f"onclick=\"showLabwareOptions('{slot_str}')\" style=\"cursor:pointer;\""
             )
         elif info["type"] == "labware":
+            safe_name = display_name.replace("'", "\\'")
             info["click_attr"] = (
-                f"onclick=\"openMoveLabwareDialog('{slot_str}', {json.dumps(display_name)})\" "
+                f"onclick=\"openMoveLabwareDialog('{slot_str}', '{safe_name}')\" "
                 f"style=\"cursor:pointer;\""
             )
 
@@ -207,11 +201,12 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
         compact = mode == "simple"
 
         # Base layout: rows top→bottom are A→D (back to front of robot).
+        # All keys are Flex alphanumeric end-to-end.
         base_layout = [
-            ["10", "11", "12"],  # Row A
-            ["7",  "8",  "9" ],  # Row B
-            ["4",  "5",  "6" ],  # Row C
-            ["1",  "2",  "3" ],  # Row D
+            ["A1", "A2", "A3"],  # Row A (back)
+            ["B1", "B2", "B3"],  # Row B
+            ["C1", "C2", "C3"],  # Row C
+            ["D1", "D2", "D3"],  # Row D (front)
         ]
         staging_slots = []
         has_staging = self._has_staging_area()

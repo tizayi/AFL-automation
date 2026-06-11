@@ -27,12 +27,24 @@ from AFL.automation.prepare.FlexDeckWebAppMixin import FlexDeckWebAppMixin
 # Slot translation table: OT2 numeric → Flex alphanumeric
 # The Flex deck is a 4×3 grid.  Row D is at the front (≈ OT2 rows 1–3),
 # row A is at the back (≈ OT2 rows 10–12).
+# Staging slots A4–D4 are Flex-native and pass through unchanged.
 # ---------------------------------------------------------------------------
 _OT2_TO_FLEX_SLOT = {
     "1":  "D1", "2":  "D2", "3":  "D3",
     "4":  "C1", "5":  "C2", "6":  "C3",
     "7":  "B1", "8":  "B2", "9":  "B3",
     "10": "A1", "11": "A2", "12": "A3",
+}
+
+# Staging-area slots are column-4 slots reachable only by the gripper.
+_STAGING_SLOTS = {"A4", "B4", "C4", "D4"}
+
+# Maps a staging slot to the cutout whose right-side fixture enables it.
+_STAGING_SLOT_TO_CUTOUT = {
+    "A4": "cutoutA3",
+    "B4": "cutoutB3",
+    "C4": "cutoutC3",
+    "D4": "cutoutD3",
 }
 
 # Canonical config key used for the 96-channel pipette.  The Opentrons HTTP API
@@ -71,7 +83,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     """
 
     ROBOT_TYPE = "OT-3"
-    API_VERSION = "3"
+    API_VERSION = "4"
 
     # When dropping tips the Flex uses a movable trash bin, not the OT2's
     # fixed-position trash at slot 12.  The addressable area name depends on
@@ -108,7 +120,18 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     # automatically, so inherited keys do not need to be repeated here.
     defaults = {
         "deck_configuration": [
-            {"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"},
+            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutA1"},
+            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutB1"},
+            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutC1"},
+            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutD1"},
+            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutA2"},
+            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutB2"},
+            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutC2"},
+            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutD2"},
+            {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
+            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutB3"},
+            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutC3"},
+            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutD3"},
         ],
         # Persists across runs: None when no gripper loaded, otherwise
         # {"gripper_id": <run-scoped-id>, "serial": <serial-number>}.
@@ -118,12 +141,17 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     def __init__(self, overrides=None):
         # Set Flex API version header BEFORE OT2HTTPDriver.__init__ so that
         # _initialize_robot() (called inside OT2HTTPDriver.__init__) uses
-        # Opentrons-Version: 3 from the very first request.
+        # Opentrons-Version: 4 from the very first request.
         self.headers = {"Opentrons-Version": self.API_VERSION}
         OT2HTTPDriver.__init__(self, overrides=overrides)
         self.name = "FlexHTTPDriver"
         # Override the API version header set by OT2HTTPDriver.__init__.
         self.headers = {"Opentrons-Version": self.API_VERSION}
+
+    def _initialize_robot(self):
+        """Initialize connection, then apply robot-level deck configuration."""
+        super()._initialize_robot()
+        self._apply_deck_configuration()
 
     # ------------------------------------------------------------------
     # Slot translation
@@ -139,6 +167,11 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         Slots already in Flex format (e.g. ``"A1"``, ``"D3"``) are returned
         unchanged, so direct Flex-format input also works.
 
+        Staging slots ``"A4"``–``"D4"`` are Flex-native and pass through
+        unchanged.  They are only reachable by the gripper; pipettes cannot
+        access them.  Enable them in the deck configuration via
+        :meth:`set_staging_areas` before use.
+
         Parameters
         ----------
         slot : str or int
@@ -148,53 +181,58 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         str
             Flex alphanumeric slot name.
         """
-        s = str(slot).strip()
+        s = str(slot).strip().upper()
         return _OT2_TO_FLEX_SLOT.get(s, s)
 
     def _api_slot_name(self, slot):
         """Return the Flex slot name to use in HTTP API commands."""
         return self._normalize_slot(slot)
 
+    def _slot_location(self, slot):
+        """Return the location dict for loadLabware/moveLabware API commands.
+
+        Staging slots (A4\u2013D4) are addressable areas, not deck slots, so they
+        require ``{"addressableAreaName": ...}`` instead of ``{"slotName": ...}``.
+        """
+        flex_slot = self._normalize_slot(slot)
+        if flex_slot in _STAGING_SLOTS:
+            return {"addressableAreaName": flex_slot}
+        return {"slotName": flex_slot}
+
     # ------------------------------------------------------------------
     # Deck configuration
     # ------------------------------------------------------------------
 
     def _after_run_created(self, run_id):
-        """Apply deck config and optionally reload the gripper after a new run is created.
+        """Hook called by OT2HTTPDriver._create_run after a new run is created.
 
-        Called by :meth:`OT2HTTPDriver._create_run` before any labware or
-        instruments are loaded onto the new run.
+        In API v4+ the gripper is implicitly available and requires no
+        per-run registration, so this is a no-op.
         """
-        self._apply_deck_configuration(run_id)
-        # Re-register the gripper with the new run if it was loaded previously.
-        if self.config.get("loaded_gripper"):
-            self.load_gripper()
+        pass
 
-    def _apply_deck_configuration(self, run_id):
-        """POST the deck configuration for *run_id* to the robot.
+    def _apply_deck_configuration(self):
+        """Set the robot-level deck configuration via ``PUT /deck_configuration``.
 
-        The deck configuration tells the Flex which fixtures (trash bin, waste
-        chute, staging areas, modules) occupy each cutout.  It must be set
-        before labware loading commands are sent.
+        In Opentrons API v4+, deck configuration is a robot-level setting, not
+        scoped to a run.  Call this once after connecting (or whenever the
+        physical deck layout changes) before creating a run.
 
-        Parameters
-        ----------
-        run_id : str
-            The run ID returned by the ``POST /runs`` call.
+        The payload format is a list of cutout fixture assignments::
+
+            [{"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"}, ...]
         """
         deck_config = self.config.get("deck_configuration", [])
         if not deck_config:
             self.log_info("No deck configuration defined; skipping.")
             return
 
-        self.log_info(
-            f"Applying deck configuration for run {run_id}: {deck_config}"
-        )
+        self.log_info(f"Applying deck configuration: {deck_config}")
 
-        response = requests.patch(
-            url=f"{self.base_url}/runs/{run_id}/deckConfiguration",
+        response = requests.put(
+            url=f"{self.base_url}/deck_configuration",
             headers=self.headers,
-            json={"data": deck_config},
+            json={"data": {"cutoutFixtures": deck_config}},
         )
 
         if response.status_code not in (200, 201):
@@ -205,23 +243,58 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
 
         self.log_info("Flex deck configuration applied successfully.")
 
+    @Driver.unqueued()
+    def set_staging_areas(self, cutouts):
+        """Enable staging-area slots on the specified right-column cutouts.
+
+        Replaces ``singleRightSlot`` entries in ``deck_configuration`` with
+        ``stagingAreaRightSlot`` for the given cutouts, then immediately
+        re-applies the deck configuration to the robot.
+
+        Staging slots (A4–D4) are only reachable by the gripper.  The
+        corresponding regular slot (e.g. B3 when enabling B4) remains
+        accessible — ``stagingAreaRightSlot`` provides *both* areas.
+
+        Parameters
+        ----------
+        cutouts : list of str
+            One or more cutout IDs to enable staging on, e.g.
+            ``["cutoutB3", "cutoutC3"]``.
+
+        Example
+        -------
+        Enable staging slots B4 and C4::
+
+            driver.set_staging_areas(["cutoutB3", "cutoutC3"])
+        """
+        cutout_set = set(cutouts)
+        new_config = []
+        for entry in self.config.get("deck_configuration", []):
+            if entry["cutoutId"] in cutout_set and entry["cutoutFixtureId"] == "singleRightSlot":
+                new_config.append({"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": entry["cutoutId"]})
+            else:
+                new_config.append(entry)
+        self.config["deck_configuration"] = new_config
+        self.config._update_history()
+        self._apply_deck_configuration()
+        self.log_info(f"Staging areas enabled for: {sorted(cutout_set)}")
+
     # ------------------------------------------------------------------
     # Gripper
     # ------------------------------------------------------------------
 
     def load_gripper(self):
-        """Find the attached Flex gripper and register it with the current run.
+        """Detect the attached Flex gripper and record it in config.
 
         Queries ``GET /instruments`` to locate the gripper on the ``extension``
-        mount, then issues a ``loadGripper`` setup command.  The resulting
-        run-scoped gripper ID is stored in ``config['loaded_gripper']`` and
-        persists across runs so the gripper is automatically re-registered
-        when a new run is created.
+        mount.  In API v4+ the gripper is implicitly available to ``moveLabware``
+        without any run command — this method simply confirms it is attached and
+        stores its serial so the frontend can show gripper status.
 
         Returns
         -------
         str
-            The run-scoped gripper ID assigned by the robot.
+            The gripper serial number.
 
         Raises
         ------
@@ -229,8 +302,6 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             If no gripper is physically attached to the extension mount, or if
             the HTTP API call fails.
         """
-        run_id = self._ensure_run_exists()
-
         instr_response = requests.get(
             url=f"{self.base_url}/instruments",
             headers=self.headers,
@@ -261,30 +332,13 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 "or empty in the /instruments response."
             )
 
-        cmd_response = requests.post(
-            url=f"{self.base_url}/runs/{run_id}/commands",
-            headers=self.headers,
-            params={"waitUntilComplete": True},
-            json={
-                "data": {
-                    "commandType": "loadGripper",
-                    "params": {"gripperId": gripper_serial},
-                    "intent": "setup",
-                }
-            },
-        )
-        self._check_cmd_success(cmd_response)
-
-        result = cmd_response.json()["data"]["result"]
-        gripper_run_id = result.get("gripperId", gripper_serial)
-
         self.config["loaded_gripper"] = {
-            "gripper_id": gripper_run_id,
+            "gripper_id": gripper_serial,
             "serial": gripper_serial,
         }
         self.config._update_history()
-        self.log_info(f"Gripper loaded with run-scoped ID {gripper_run_id}")
-        return gripper_run_id
+        self.log_info(f"Gripper detected with serial {gripper_serial}")
+        return gripper_serial
 
     @Driver.quickbar(
         qb={
@@ -326,7 +380,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         RuntimeError
             If *use_gripper* is ``True`` but the gripper has not been loaded.
         """
-        source_slot = str(source_slot)
+        source_slot = self._normalize_slot(source_slot)
 
         if source_slot not in self.config["loaded_labware"]:
             raise ValueError(
@@ -347,7 +401,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         if dest_str == "offdeck":
             new_location = "offDeck"
         else:
-            new_location = {"slotName": self._api_slot_name(dest_slot)}
+            new_location = self._slot_location(dest_slot)
 
         run_id = self._ensure_run_exists()
 
@@ -372,18 +426,18 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         # Update labware tracking to reflect the new position.
         del self.config["loaded_labware"][source_slot]
         if dest_str != "offdeck":
-            self.config["loaded_labware"][str(dest_slot)] = (
+            self.config["loaded_labware"][self._normalize_slot(dest_slot)] = (
                 labware_id, labware_name, labware_data
             )
         self.config._update_history()
 
         self.log_info(
-            f"Moved '{labware_name}' from slot {source_slot} to {dest_slot} "
+            f"Moved '{labware_name}' from slot {source_slot} to {self._normalize_slot(dest_slot)} "
             f"(strategy: {strategy!r})"
         )
         return {
             "source_slot": source_slot,
-            "dest_slot": str(dest_slot),
+            "dest_slot": self._normalize_slot(dest_slot),
             "strategy": strategy,
             "labware_id": labware_id,
         }

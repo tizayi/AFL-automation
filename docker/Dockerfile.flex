@@ -28,7 +28,6 @@ ENV PATH=/root/.local/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \
     AFL_FLEX_PORT=5003
 
-COPY . .
 RUN mkdir -p /root/.afl
 
 EXPOSE 5003

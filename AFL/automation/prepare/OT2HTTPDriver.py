@@ -332,6 +332,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.max_transfer = None
 
             for pipette in pipettes_data:
+                if pipette.get("instrumentType") != "pipette":
+                    continue
                 mount = pipette['mount']
 
                 try:
@@ -611,7 +613,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             slot, well = self.parse_well(loc)
 
             # Get labware info from the slot
-            labware_info = self.config['loaded_labware'].get(slot)
+            labware_info = self.config['loaded_labware'].get(self._api_slot_name(slot))
 
             if not labware_info:
                 raise ValueError(f"No labware found in slot {slot}")
@@ -625,8 +627,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self.log_debug(f"Created well objects: {wells}")
         
         # Check well validity here
-        assert slot in self.config["loaded_labware"].keys(), f"Slot {slot} does not have any loaded labware"
-        assert well in self.config["loaded_labware"][slot][2]['definition']['wells'].keys(), f"Well {well} is not a valid well for slot {slot}, {self.config['loaded_labware'][slot][2]['definition']['metadata']['displayName']}"
+        _key = self._api_slot_name(slot)
+        assert _key in self.config["loaded_labware"].keys(), f"Slot {slot} does not have any loaded labware"
+        assert well in self.config["loaded_labware"][_key][2]['definition']['wells'].keys(), f"Well {well} is not a valid well for slot {slot}, {self.config['loaded_labware'][_key][2]['definition']['metadata']['displayName']}"
         
         return wells
     def _check_cmd_success(self, response):
@@ -811,9 +814,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 del self.config["loaded_labware"][slot]
             if str(slot) in self.config["loaded_modules"].keys():
                 # we need to load into a module, not a slot
-                location = {"moduleId": self.config["loaded_modules"][str(slot)][0]}
+                location = {"moduleId": self.config["loaded_modules"][self._api_slot_name(slot)][0]}
             else:
-                location = {"slotName": self._api_slot_name(slot)}
+                location = self._slot_location(slot)
                 
             # Prepare the loadLabware command
             command_dict = {
@@ -873,8 +876,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     f"Failed to extract labware ID from response: {str(e)}"
                 )
             result = response_data["data"]["result"]
-            # Store the labware information directly in config
-            self.config["loaded_labware"][slot] = (labware_id, name, result)
+            # Store the labware information directly in config.
+            # Use _api_slot_name so the key format matches what the API uses
+            # (numeric on OT2, Flex alphanumeric on Flex).
+            self.config["loaded_labware"][self._api_slot_name(slot)] = (labware_id, name, result)
 
             # If this is a module, store it
             if module:
@@ -959,8 +964,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     f"Failed to extract module ID from response: {str(e)}"
                 )
 
-            # Store the module information directly in config
-            self.config["loaded_modules"][str(slot)] = (module_id, name)
+            # Store the module information directly in config.
+            # Use _api_slot_name so the key format is consistent with load_labware.
+            self.config["loaded_modules"][self._api_slot_name(slot)] = (module_id, name)
 
             self.log_info(
                 f"Successfully loaded module '{name}' in slot {slot} with ID {module_id}"
@@ -1050,7 +1056,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             # Get the tip rack IDs - note that loaded_labware now stores tuples of (id, name)
             tip_racks = []
             for slot in listify(tip_rack_slots):
-                labware_info = self.config["loaded_labware"].get(slot)
+                labware_info = self.config["loaded_labware"].get(self._api_slot_name(slot))
                 if (
                     labware_info
                     and isinstance(labware_info, tuple)
@@ -1103,13 +1109,21 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """Return the slot name to pass to the HTTP API. Override in subclasses for robots with different slot naming."""
         return str(slot)
 
+    def _slot_location(self, slot):
+        """Return the location dict for a loadLabware/moveLabware API command.
+
+        Override in subclasses to handle robots with addressable-area slots
+        (e.g. Flex staging slots A4–D4).
+        """
+        return {"slotName": self._api_slot_name(slot)}
+
     def _warn_on_tiprack_mismatch(self, pipette_name, tip_rack_slots):
         token = self.EXPECTED_TIPRACK_TOKEN.get(pipette_name)
         if token is None:
             return
         mismatched_slots = []
         for slot in tip_rack_slots:
-            labware_info = self.config["loaded_labware"].get(str(slot))
+            labware_info = self.config["loaded_labware"].get(self._api_slot_name(slot))
             if labware_info is None:
                 continue
             labware_name = str(labware_info[1]).lower()
