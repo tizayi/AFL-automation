@@ -70,12 +70,9 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
     # Deck configuration — no HTTP, just log
     # ------------------------------------------------------------------
 
-    def _apply_deck_configuration(self, run_id):
+    def _apply_deck_configuration(self):
         deck_config = self.config.get("deck_configuration", [])
-        self.log_info(
-            f"Virtual: deck configuration applied for run {run_id} "
-            f"({len(deck_config)} fixture(s))"
-        )
+        self.log_info(f"Virtual: deck configuration applied ({len(deck_config)} fixture(s))")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -124,17 +121,19 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
                 "metadata": {"displayName": name},
             }
         }
-        self.config["loaded_labware"][str(slot)] = (labware_id, name, definition)
+        flex_slot = self._normalize_slot(slot)
+        self.config["loaded_labware"][flex_slot] = (labware_id, name, definition)
         self.config._update_history()
-        self.log_info(f"Virtual: loaded labware '{name}' in slot {slot} → {labware_id}")
+        self.log_info(f"Virtual: loaded labware '{name}' in slot {flex_slot} → {labware_id}")
         return labware_id
 
     def load_module(self, name, slot, **kwargs):
         """Register a module in a slot without contacting the robot."""
         module_id = self._generate_id("module")
-        self.config["loaded_modules"][str(slot)] = (module_id, name)
+        flex_slot = self._normalize_slot(slot)
+        self.config["loaded_modules"][flex_slot] = (module_id, name)
         self.config._update_history()
-        self.log_info(f"Virtual: loaded module '{name}' in slot {slot} → {module_id}")
+        self.log_info(f"Virtual: loaded module '{name}' in slot {flex_slot} → {module_id}")
         return module_id
 
     def load_instrument(self, name, mount, tip_rack_slots, reload=False, **kwargs):
@@ -217,7 +216,7 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
 
     def move_labware(self, source_slot, dest_slot, use_gripper=True):
         """Simulate a labware move by updating config tracking."""
-        source_slot = str(source_slot)
+        source_slot = self._normalize_slot(source_slot)
         if source_slot not in self.config["loaded_labware"]:
             raise ValueError(
                 f"No labware loaded in slot {source_slot!r}. "
@@ -235,18 +234,19 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
 
         del self.config["loaded_labware"][source_slot]
         if dest_str != "offdeck":
-            self.config["loaded_labware"][str(dest_slot)] = (
-                labware_id, labware_name, labware_data
-            )
+            flex_dest = self._normalize_slot(dest_slot)
+            self.config["loaded_labware"][flex_dest] = (labware_id, labware_name, labware_data)
+        else:
+            flex_dest = "offDeck"
         self.config._update_history()
 
         self.log_info(
             f"Virtual: moved '{labware_name}' from slot {source_slot} to "
-            f"{dest_slot} ({strategy})"
+            f"{flex_dest} ({strategy})"
         )
         return {
             "source_slot": source_slot,
-            "dest_slot": str(dest_slot),
+            "dest_slot": flex_dest,
             "strategy": strategy,
             "labware_id": labware_id,
         }

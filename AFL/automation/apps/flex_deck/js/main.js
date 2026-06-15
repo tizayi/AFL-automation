@@ -30,8 +30,8 @@ function showLabwareOptions(slot) {
         buttons: {
             'Load': function() {
                 var lw = select.val();
-                var isHeaterShaker = (lw === 'heaterShakerModuleV1') || (lw === 'thermocyclerModuleV2');
-                var task = isHeaterShaker ? 'load_module' : 'load_labware';
+                var moduleNames = ['heaterShakerModuleV1', 'thermocyclerModuleV2', 'magneticBlockV1', 'temperatureModuleV2', 'absorbanceReaderV1'];
+                var task = moduleNames.indexOf(lw) !== -1 ? 'load_module' : 'load_labware';
                 login().then(function(tok) {
                     $.ajax({
                         type: 'POST',

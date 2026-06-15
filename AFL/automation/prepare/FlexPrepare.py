@@ -25,10 +25,6 @@ class FlexPrepare(FlexHTTPDriver, PrepareDriver):
         "stock_locations": {},
         "stock_transfer_params": {},
         "catch_protocol": {},
-        # Default Flex deck: trash bin in cutout A3.
-        "deck_configuration": [
-            {"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"},
-        ],
     }
 
     def __init__(self, overrides=None):

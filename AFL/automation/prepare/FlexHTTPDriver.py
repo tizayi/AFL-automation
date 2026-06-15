@@ -3,18 +3,14 @@ FlexHTTPDriver — Opentrons Flex (OT-3) support for AFL.
 
 The Flex uses the same HTTP API base as the OT2 but with key differences:
 
-* API version header: ``Opentrons-Version: 3``
+* API version header: ``Opentrons-Version: 4``
 * Deck slots: alphanumeric ``A1–D3`` (and staging ``A4–D4``) instead of
   numeric ``1–12``.
 * Pipette names: ``flex_1channel_50``, ``flex_1channel_1000``, etc.
-* Deck configuration must be declared before labware is loaded on each run.
+* Deck configuration is a robot-level setting (not per-run) that must be
+  applied before any labware or modules are loaded.
 * Trash is a configurable fixture (trash bin or waste chute), not a fixed
   location at slot 12.
-
-Users interact with the driver using the same OT2 numeric slot convention
-(``1``–``12``).  :meth:`_normalize_slot` translates these internally before
-any command reaches the HTTP API so that no user-facing config needs to change
-when switching from an OT2 to a Flex.
 """
 
 import requests
@@ -47,6 +43,19 @@ _STAGING_SLOT_TO_CUTOUT = {
     "D4": "cutoutD3",
 }
 
+# Modules that require a dedicated cutout fixture (same ID as the model name).
+# Temperature Module V2 uses no special fixture and is absent from this map.
+_MODULE_FIXTURE_IDS = {
+    "heaterShakerModuleV1": "heaterShakerModuleV1",
+    "magneticBlockV1":      "magneticBlockV1",
+    "thermocyclerModuleV2": "thermocyclerModuleV2",
+    "absorbanceReaderV1":   "absorbanceReaderV1",
+}
+
+# The Thermocycler on the Flex occupies two cutouts.  B1 is the user-facing
+# primary slot (OT2 slot 7); A1 is the additional cutout behind it (OT2 slot 10).
+_THERMOCYCLER_CUTOUTS = {"cutoutA1", "cutoutB1"}
+
 # Canonical config key used for the 96-channel pipette.  The Opentrons HTTP API
 # addresses it as "left" mount, but storing it under a distinct key prevents
 # collision with an independent left-mount single-channel pipette.
@@ -68,18 +77,19 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     -----------------------------------------------------------------------
     deck_configuration : list of dict
         Opentrons deck-configuration payload.  Each entry is a dict with keys
-        ``cutoutId`` and ``cutoutFixtureId``.  Sent to the robot once per run
-        before any labware is loaded.
+        ``cutoutId`` and ``cutoutFixtureId``.  Applied to the robot once at
+        startup via ``PUT /deck_configuration`` (robot-level, not per-run).
 
-        Default: a single trash bin in cutout A3 (the most common Flex setup)::
-
-            [{"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"}]
+        Default: all 12 cutouts populated — left/center columns as plain slots,
+        A3 as trash bin, B3/C3/D3 as ``stagingAreaRightSlot`` (enables the
+        staging column B4/C4/D4 by default).
 
         Common fixture IDs:
-        - ``"trashBinAdapter"``  — trash bin
+        - ``"trashBinAdapter"``       — trash bin
         - ``"wasteChuteOnlyAdapter"`` — waste chute (no staging)
-        - ``"stagingAreaRightSlot"`` — staging area (enables D4/C4/B4/A4)
-        - ``"magneticBlockV1"``  — magnetic block
+        - ``"stagingAreaRightSlot"``  — staging area (provides both X3 and X4)
+        - ``"heaterShakerModuleV1"``  — heater-shaker (set automatically by load_module)
+        - ``"magneticBlockV1"``       — magnetic block (set automatically by load_module)
     """
 
     ROBOT_TYPE = "OT-3"
@@ -128,21 +138,18 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutB2"},
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutC2"},
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutD2"},
-            {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
-            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutB3"},
-            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutC3"},
-            {"cutoutFixtureId": "singleRightSlot", "cutoutId": "cutoutD3"},
+            {"cutoutFixtureId": "trashBinAdapter",       "cutoutId": "cutoutA3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutB3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutC3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutD3"},
         ],
-        # Persists across runs: None when no gripper loaded, otherwise
-        # {"gripper_id": <run-scoped-id>, "serial": <serial-number>}.
+        # None when no gripper detected, otherwise {"gripper_id": <serial>, "serial": <serial>}.
         "loaded_gripper": None,
     }
 
     def __init__(self, overrides=None):
         # Set Flex API version header BEFORE OT2HTTPDriver.__init__ so that
         # _initialize_robot() (called inside OT2HTTPDriver.__init__) uses
-        # Opentrons-Version: 4 from the very first request.
-        self.headers = {"Opentrons-Version": self.API_VERSION}
         OT2HTTPDriver.__init__(self, overrides=overrides)
         self.name = "FlexHTTPDriver"
         # Override the API version header set by OT2HTTPDriver.__init__.
@@ -169,8 +176,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
 
         Staging slots ``"A4"``–``"D4"`` are Flex-native and pass through
         unchanged.  They are only reachable by the gripper; pipettes cannot
-        access them.  Enable them in the deck configuration via
-        :meth:`set_staging_areas` before use.
+        access them.  They are enabled by default in the deck configuration.
 
         Parameters
         ----------
@@ -247,6 +253,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     def set_staging_areas(self, cutouts):
         """Enable staging-area slots on the specified right-column cutouts.
 
+        Staging areas are enabled by default (B3/C3/D3 use ``stagingAreaRightSlot``
+        in the default deck configuration).  Call this only if a cutout was
+        previously set to ``singleRightSlot`` and needs to be restored.
+
         Replaces ``singleRightSlot`` entries in ``deck_configuration`` with
         ``stagingAreaRightSlot`` for the given cutouts, then immediately
         re-applies the deck configuration to the robot.
@@ -260,12 +270,6 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         cutouts : list of str
             One or more cutout IDs to enable staging on, e.g.
             ``["cutoutB3", "cutoutC3"]``.
-
-        Example
-        -------
-        Enable staging slots B4 and C4::
-
-            driver.set_staging_areas(["cutoutB3", "cutoutC3"])
         """
         cutout_set = set(cutouts)
         new_config = []
@@ -465,12 +469,27 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 self.pipette_info[_96CH_MOUNT_KEY]["id"] = stored_id
 
     def reset_deck(self):
-        """Reset the deck configuration, including gripper registration."""
+        """Reset deck state, revert module fixtures, and clear gripper."""
         super().reset_deck()
-        # OT2HTTPDriver.reset_deck() does not know about loaded_gripper.
-        # Clear it here so _after_run_created does not attempt to re-register a
-        # stale gripper serial against the freshly-created run.
         self.config["loaded_gripper"] = None
+
+        # Revert any module-specific cutout fixtures back to the default plain-slot
+        # fixture for their column.  load_module will re-declare the correct fixture
+        # when the module is reloaded on the next run.
+        _module_fixtures = set(_MODULE_FIXTURE_IDS.values())
+        _col_default = {"1": "singleLeftSlot", "2": "singleCenterSlot", "3": "stagingAreaRightSlot"}
+        new_deck_config = []
+        for entry in self.config.get("deck_configuration", []):
+            if entry["cutoutFixtureId"] in _module_fixtures:
+                col = entry["cutoutId"][-1]
+                new_deck_config.append({
+                    "cutoutId": entry["cutoutId"],
+                    "cutoutFixtureId": _col_default.get(col, "singleLeftSlot"),
+                })
+            else:
+                new_deck_config.append(entry)
+        self.config["deck_configuration"] = new_deck_config
+        self.config._update_history()
 
     def load_instrument(self, name, mount, tip_rack_slots, reload=False, **kwargs):
         """Load a pipette, routing the 96-channel to its own config key.
@@ -528,6 +547,51 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ]
         self.config._update_history()
         return (first_rack_id, "A1")
+
+    def load_module(self, name, slot, check_run_status=True, **kwargs):
+        """Load a module, updating the deck configuration first if required.
+
+        Modules like the heater-shaker and magnetic block need their cutout
+        declared as a specific fixture before the Flex API will accept a
+        ``loadModule`` command.  This override swaps the plain slot fixture for
+        the module fixture, re-applies the deck configuration, then delegates
+        to the parent implementation.
+        """
+        flex_slot = self._normalize_slot(slot)
+        cutout_id = f"cutout{flex_slot}"
+
+        if name == "thermocyclerModuleV2":
+            # Thermocycler always occupies cutoutA1 (behind) and cutoutB1 (primary),
+            # regardless of which slot the caller nominates.  Handle it separately so
+            # the general single-cutout logic cannot write a stale third entry.
+            new_config = [
+                e for e in self.config.get("deck_configuration", [])
+                if e["cutoutId"] not in _THERMOCYCLER_CUTOUTS
+            ]
+            for c in sorted(_THERMOCYCLER_CUTOUTS):
+                new_config.append({"cutoutId": c, "cutoutFixtureId": "thermocyclerModuleV2"})
+            self.config["deck_configuration"] = new_config
+            self.config._update_history()
+            self._apply_deck_configuration()
+        else:
+            fixture_id = _MODULE_FIXTURE_IDS.get(name)
+            if fixture_id:
+                # Replace the existing fixture entry for this cutout (or append if absent).
+                new_config = []
+                replaced = False
+                for entry in self.config.get("deck_configuration", []):
+                    if entry["cutoutId"] == cutout_id:
+                        new_config.append({"cutoutId": cutout_id, "cutoutFixtureId": fixture_id})
+                        replaced = True
+                    else:
+                        new_config.append(entry)
+                if not replaced:
+                    new_config.append({"cutoutId": cutout_id, "cutoutFixtureId": fixture_id})
+                self.config["deck_configuration"] = new_config
+                self.config._update_history()
+                self._apply_deck_configuration()
+
+        return super().load_module(name, slot, check_run_status=check_run_status, **kwargs)
 
     @Driver.queued()
     def configure_nozzle_layout(self, config_type="full96", **kwargs):
