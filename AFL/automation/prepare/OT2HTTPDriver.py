@@ -1,4 +1,6 @@
 import requests
+import atexit
+import signal
 import time
 import logging
 
@@ -77,6 +79,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         # Initialize the robot connection
         self._initialize_robot()
 
+        # Ensure the active run is stopped gracefully when the Python process exits
+        # (covers normal shutdown, Ctrl-C, and SIGTERM from Docker / the OS).
+        atexit.register(self.stop_run)
+        self._install_sigterm_handler()
 
         self.useful_links['View Deck'] = '/visualize_deck'
 
@@ -89,6 +95,35 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 log_method(message)
         else:
             print(f"[{level.upper()}] {message}")
+
+    def _install_sigterm_handler(self):
+        """Install a SIGTERM handler that stops the active run before exiting.
+
+        Only installed when running as the main process (not in a worker thread)
+        and only when no handler has already been set by the caller.  This makes
+        Docker ``docker stop`` (which sends SIGTERM) trigger a clean shutdown
+        instead of killing the process mid-command.
+        """
+        import threading
+
+        # Only install from the main thread; signal.signal() raises in other threads.
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        existing = signal.getsignal(signal.SIGTERM)
+        # Don't override if something else (e.g. waitress) already registered a handler.
+        if existing not in (signal.SIG_DFL, signal.SIG_IGN, None):
+            return
+
+        def _sigterm_handler(signum, frame):
+            self.log_info("SIGTERM received — stopping active run before exit.")
+            self.stop_run()
+            # Re-raise as SystemExit so atexit hooks still run.
+            raise SystemExit(0)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
 
     def log_info(self, message):
         """Log info message safely"""
@@ -302,6 +337,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             if response.status_code != 200:
                 raise ConnectionError(f"Failed to connect to robot at {self.base_url}")
 
+            # Stop and delete any run left over from a previous AFL session so we
+            # always start from a clean slate.
+            self._cleanup_stale_run()
+
             # Get attached pipettes
             self._update_pipettes()
         except requests.exceptions.RequestException as e:
@@ -502,6 +541,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def reset(self):
         self.log_info("Resetting the protocol context")
+
+        # Stop the current run on the robot before tearing down state.
+        self.stop_run()
 
         # Delete any active session
         if self.session_id:
@@ -2207,6 +2249,83 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self.log_error(f"Error getting RPM: {str(e)}")
             return f"Error: {str(e)}"
         
+    def stop_run(self):
+        """Send a stop action for the current run and wait for it to reach a terminal state.
+
+        Safe to call at any time (no-op if there is no active run or the run is
+        already in a terminal state).  Used by the atexit hook and SIGTERM handler
+        so the robot does not keep the run in an indeterminate state after the
+        AFL server exits.
+        """
+        run_id = getattr(self, "run_id", None)
+        if not run_id:
+            return
+
+        try:
+            # Check current state first so we don't try to stop an already-done run.
+            resp = requests.get(
+                url=f"{self.base_url}/runs/{run_id}",
+                headers=self.headers,
+                timeout=5,
+            )
+            if resp.status_code != 200:
+                return  # Run doesn't exist on the robot — nothing to do.
+
+            status = resp.json().get("data", {}).get("status", "")
+            if status in ("stopped", "failed", "succeeded", "finishing"):
+                return
+
+            # Send the stop action.
+            self.log_info(f"Stopping run {run_id} (current status: {status!r})")
+            requests.post(
+                url=f"{self.base_url}/runs/{run_id}/actions",
+                headers=self.headers,
+                json={"data": {"actionType": "stop"}},
+                timeout=10,
+            )
+
+            # Poll until the robot confirms a terminal state (max ~10 s).
+            for _ in range(20):
+                time.sleep(0.5)
+                poll = requests.get(
+                    url=f"{self.base_url}/runs/{run_id}",
+                    headers=self.headers,
+                    timeout=5,
+                )
+                if poll.status_code == 200:
+                    new_status = poll.json().get("data", {}).get("status", "")
+                    if new_status in ("stopped", "failed", "succeeded"):
+                        self.log_info(f"Run {run_id} reached status {new_status!r}")
+                        break
+
+        except Exception as e:  # noqa: BLE001 — best-effort, must not raise on shutdown
+            self.log_warning(f"stop_run: error stopping run {run_id}: {e}")
+        finally:
+            self.run_id = None
+
+    def _cleanup_stale_run(self):
+        """Stop and delete any run left over from a previous AFL session.
+
+        Called at startup (before a new run is created) so we never accumulate
+        orphaned runs on the robot and always start from a clean slate.
+        """
+        run_id = getattr(self, "run_id", None)
+        if not run_id:
+            return
+
+        self.log_info(f"Cleaning up stale run from previous session: {run_id}")
+        self.stop_run()  # sets self.run_id = None internally
+
+        # Delete the run from the robot so it doesn't appear in its history.
+        try:
+            requests.delete(
+                url=f"{self.base_url}/runs/{run_id}",
+                headers=self.headers,
+                timeout=5,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"_cleanup_stale_run: could not delete run {run_id}: {e}")
+
     def _create_run(self):
         """Create a run on the robot for executing commands"""
         self.log_info("Creating a new run for commands")

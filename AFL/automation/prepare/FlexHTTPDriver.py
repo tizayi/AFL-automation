@@ -97,20 +97,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
 
     # When dropping tips the Flex uses a movable trash bin, not the OT2's
     # fixed-position trash at slot 12.  The addressable area name depends on
-    # which cutout the trash bin is placed in; cutoutA3 → movableTrashA3,
-    # cutoutD3 → movableTrashD3, etc.
-    # Override ``TRASH_ADDRESSABLE_AREA`` in a subclass, or set
-    # ``trash_bin_cutout`` in config to one of "cutoutA3"–"cutoutD3" and the
-    # correct addressable area name will be derived automatically at startup.
+    # which cutout the trash bin is placed in; cutoutA3 → movableTrashA3.
+    # Override ``TRASH_ADDRESSABLE_AREA`` or set ``trash_addressable_area`` in
+    # config if your deck uses a different cutout or a waste chute.
     TRASH_ADDRESSABLE_AREA = "movableTrashA3"
-
-    # Maps cutout IDs to the addressable area name used when dropping tips.
-    _TRASH_CUTOUT_TO_AREA = {
-        "cutoutA3": "movableTrashA3",
-        "cutoutB3": "movableTrashB3",
-        "cutoutC3": "movableTrashC3",
-        "cutoutD3": "movableTrashD3",
-    }
 
     PIPETTE_NAME_ALIASES = {
         # Full names pass through unchanged.
@@ -193,8 +183,42 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         # via polymorphism, so we must override it here before any requests go out.
         self.headers = {"Opentrons-Version": self.API_VERSION}
         super()._initialize_robot()
+        self._home_if_needed()
         self._apply_deck_configuration()
         self._autodetect_trash_area()
+
+    def _home_if_needed(self):
+        """Home the robot if any gantry axis is not engaged (i.e. after power-on or E-stop).
+
+        Queries ``GET /motors/engaged`` and homes all axes if X or Y are not
+        holding position.  Skips homing (~30 s) when the robot is already ready.
+        """
+        try:
+            response = requests.get(
+                url=f"{self.base_url}/motors/engaged",
+                headers=self.headers,
+            )
+            if response.status_code != 200:
+                self.log_warning(
+                    f"Could not check motor engagement (HTTP {response.status_code}); "
+                    "homing to be safe."
+                )
+                self.home()
+                return
+
+            engaged = response.json()
+            # X and Y are the key gantry axes; if either isn't engaged the robot
+            # hasn't been homed since boot.
+            x_ok = engaged.get("x", {}).get("enabled", False)
+            y_ok = engaged.get("y", {}).get("enabled", False)
+            if not (x_ok and y_ok):
+                self.log_info("Gantry axes not engaged — homing robot before use.")
+                self.home()
+            else:
+                self.log_info("Gantry axes already engaged; skipping startup home.")
+        except Exception as e:
+            self.log_warning(f"Motor engagement check failed ({e}); homing to be safe.")
+            self.home()
 
     def _autodetect_trash_area(self):
         """Set TRASH_ADDRESSABLE_AREA from the deck configuration.
