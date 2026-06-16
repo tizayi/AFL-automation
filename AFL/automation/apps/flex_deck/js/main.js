@@ -144,7 +144,7 @@ function moveLabware(sourceSlot, destSlot, useGripper) {
 }
 
 function openPrepTargetDialog(slot, targets) {
-    var wells = targets.split(',').map(function(t) { return t.replace(/^\w+/, ''); });
+    var wells = targets.split(',').map(function(t) { return t.slice(2); });
     var rows = [];
     var cols = [];
     wells.forEach(function(w) {

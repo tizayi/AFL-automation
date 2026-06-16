@@ -653,9 +653,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         wells = []
         for loc in listify(locs):
             slot, well = self.parse_well(loc)
+            _key = self._api_slot_name(slot)
 
             # Get labware info from the slot
-            labware_info = self.config['loaded_labware'].get(self._api_slot_name(slot))
+            labware_info = self.config['loaded_labware'].get(_key)
 
             if not labware_info:
                 raise ValueError(f"No labware found in slot {slot}")
@@ -663,16 +664,19 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             if not isinstance(labware_info, tuple) or len(labware_info) < 1:
                 raise ValueError(f"Invalid labware info format in slot {slot}")
 
+            # Validate well name against the labware definition for every location.
+            valid_wells = labware_info[2]['definition']['wells'].keys()
+            if well not in valid_wells:
+                display = labware_info[2]['definition']['metadata']['displayName']
+                raise ValueError(
+                    f"Well {well!r} is not valid for {display!r} in slot {slot}. "
+                    f"Valid wells: {sorted(valid_wells)}"
+                )
+
             labware_id = labware_info[0]
             wells.append({"labwareId": labware_id, "wellName": well})
 
         self.log_debug(f"Created well objects: {wells}")
-        
-        # Check well validity here
-        _key = self._api_slot_name(slot)
-        assert _key in self.config["loaded_labware"].keys(), f"Slot {slot} does not have any loaded labware"
-        assert well in self.config["loaded_labware"][_key][2]['definition']['wells'].keys(), f"Well {well} is not a valid well for slot {slot}, {self.config['loaded_labware'][_key][2]['definition']['metadata']['displayName']}"
-        
         return wells
     def _check_cmd_success(self, response):
         if response.status_code != 201:
