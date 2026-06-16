@@ -94,6 +94,16 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             "buttons": "",
         }
 
+        # Check for blocked (physically inaccessible) slots
+        blocked = [str(s).strip().upper() for s in self.config.get("blocked_slots", [])]
+        if slot_str in blocked:
+            info.update({
+                "name": "&#9747; No Access",
+                "type": "blocked",
+                "color": "#e0e0e0",
+            })
+            return info
+
         # Check for trash fixture in this slot
         deck_config = self.config.get("deck_configuration", [])
         for entry in deck_config:

@@ -17,21 +17,29 @@ async function login() {
 
 const labwareChoices = (window.OT2DeckData && window.OT2DeckData.labwareChoices) || {};
 
+var _MODULE_NAMES = ['heaterShakerModuleV1', 'thermocyclerModuleV2', 'magneticBlockV1', 'temperatureModuleV2', 'absorbanceReaderV1'];
+var _STAGING_SLOTS = ['A4', 'B4', 'C4', 'D4'];
+
 function showLabwareOptions(slot) {
+    var isStaging = _STAGING_SLOTS.indexOf(slot) !== -1;
     var select = $('<select></select>');
     Object.entries(labwareChoices).forEach(function(entry) {
         var key = entry[0];
         var value = entry[1];
+        // Staging slots can only hold labware, not modules
+        if (isStaging && _MODULE_NAMES.indexOf(key) !== -1) return;
         select.append($('<option>').attr('value', key).text(value));
     });
+    var title = isStaging
+        ? 'Load labware in staging slot ' + slot + ' (gripper only)'
+        : 'Load labware or module in slot ' + slot;
     $('<div></div>').append(select).dialog({
-        title: 'Load labware or module in slot ' + slot,
+        title: title,
         modal: true,
         buttons: {
             'Load': function() {
                 var lw = select.val();
-                var moduleNames = ['heaterShakerModuleV1', 'thermocyclerModuleV2', 'magneticBlockV1', 'temperatureModuleV2', 'absorbanceReaderV1'];
-                var task = moduleNames.indexOf(lw) !== -1 ? 'load_module' : 'load_labware';
+                var task = _MODULE_NAMES.indexOf(lw) !== -1 ? 'load_module' : 'load_labware';
                 login().then(function(tok) {
                     $.ajax({
                         type: 'POST',

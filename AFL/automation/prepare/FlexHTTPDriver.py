@@ -97,10 +97,20 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
 
     # When dropping tips the Flex uses a movable trash bin, not the OT2's
     # fixed-position trash at slot 12.  The addressable area name depends on
-    # which cutout the trash bin is placed in; cutoutA3 → movableTrashA3.
-    # Override ``TRASH_ADDRESSABLE_AREA`` or set ``trash_addressable_area`` in
-    # config if your deck uses a different cutout or a waste chute.
+    # which cutout the trash bin is placed in; cutoutA3 → movableTrashA3,
+    # cutoutD3 → movableTrashD3, etc.
+    # Override ``TRASH_ADDRESSABLE_AREA`` in a subclass, or set
+    # ``trash_bin_cutout`` in config to one of "cutoutA3"–"cutoutD3" and the
+    # correct addressable area name will be derived automatically at startup.
     TRASH_ADDRESSABLE_AREA = "movableTrashA3"
+
+    # Maps cutout IDs to the addressable area name used when dropping tips.
+    _TRASH_CUTOUT_TO_AREA = {
+        "cutoutA3": "movableTrashA3",
+        "cutoutB3": "movableTrashB3",
+        "cutoutC3": "movableTrashC3",
+        "cutoutD3": "movableTrashD3",
+    }
 
     PIPETTE_NAME_ALIASES = {
         # Full names pass through unchanged.
@@ -145,6 +155,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ],
         # None when no gripper detected, otherwise {"gripper_id": <serial>, "serial": <serial>}.
         "loaded_gripper": None,
+        # Slots that are physically inaccessible (e.g. holes in the deck).
+        # load_labware and move_labware will refuse to target these slots.
+        # Values should be Flex alphanumeric strings: ["A2", "B2", ...].
+        "blocked_slots": [],
     }
 
     def __init__(self, overrides=None):
@@ -155,10 +169,49 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         # Override the API version header set by OT2HTTPDriver.__init__.
         self.headers = {"Opentrons-Version": self.API_VERSION}
 
+    def _check_slot_not_blocked(self, slot):
+        """Raise ValueError if *slot* is in the blocked_slots list."""
+        flex_slot = self._normalize_slot(slot)
+        blocked = [str(s).strip().upper() for s in self.config.get("blocked_slots", [])]
+        if flex_slot in blocked:
+            raise ValueError(
+                f"Slot {flex_slot!r} is physically inaccessible (listed in blocked_slots). "
+                "Remove the slot from blocked_slots in config if the obstruction is gone."
+            )
+
+    def load_labware(self, name, slot, module=None, check_run_status=True, **kwargs):
+        """Refuse loads into blocked slots; otherwise delegate to OT2HTTPDriver."""
+        self._check_slot_not_blocked(slot)
+        return super().load_labware(name, slot, module=module,
+                                    check_run_status=check_run_status, **kwargs)
+
     def _initialize_robot(self):
         """Initialize connection, then apply robot-level deck configuration."""
+        # Ensure the correct API version header is used for ALL startup calls,
+        # including _apply_deck_configuration().  OT2HTTPDriver.__init__ sets
+        # self.headers = {"Opentrons-Version": "2"} before calling this method
+        # via polymorphism, so we must override it here before any requests go out.
+        self.headers = {"Opentrons-Version": self.API_VERSION}
         super()._initialize_robot()
         self._apply_deck_configuration()
+        self._autodetect_trash_area()
+
+    def _autodetect_trash_area(self):
+        """Set TRASH_ADDRESSABLE_AREA from the deck configuration.
+
+        Scans ``deck_configuration`` for a ``trashBinAdapter`` entry and
+        derives the matching addressable area name (e.g. ``cutoutD3`` →
+        ``movableTrashD3``).  Falls back to ``"movableTrashA3"`` if none found.
+        """
+        for entry in self.config.get("deck_configuration", []):
+            if entry.get("cutoutFixtureId") == "trashBinAdapter":
+                cutout = entry.get("cutoutId", "")
+                area = self._TRASH_CUTOUT_TO_AREA.get(cutout)
+                if area:
+                    self.TRASH_ADDRESSABLE_AREA = area
+                    self.log_info(f"Trash area set to {area!r} (from {cutout!r})")
+                    return
+        self.TRASH_ADDRESSABLE_AREA = "movableTrashA3"
 
     # ------------------------------------------------------------------
     # Slot translation
@@ -193,6 +246,28 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     def _api_slot_name(self, slot):
         """Return the Flex slot name to use in HTTP API commands."""
         return self._normalize_slot(slot)
+
+    def parse_well(self, loc):
+        """Parse a Flex well location string, e.g. ``"D1A1"`` → ``("D1", "A1")``.
+
+        Flex slot names are two characters (letter + digit, e.g. ``"D1"``)
+        followed by the well name (letter(s) + digit(s), e.g. ``"A1"``).  The
+        base implementation stops at the *first* alpha character, which splits
+        ``"D1A1"`` as slot=``""`` + well=``"D1A1"`` — completely wrong for Flex.
+
+        This override reads exactly two characters as the slot prefix when the
+        string starts with a letter (Flex format), otherwise falls back to the
+        OT2 base behaviour (numeric prefix).
+        """
+        loc = str(loc)
+        if loc and loc[0].isalpha():
+            # Flex format: "<Letter><Digit><WellName>", e.g. "D1A1" or "A3H12"
+            slot = loc[:2]
+            well = loc[2:]
+        else:
+            # OT2 / numeric format: delegate to base implementation
+            slot, well = super().parse_well(loc)
+        return slot, well
 
     def _slot_location(self, slot):
         """Return the location dict for loadLabware/moveLabware API commands.
@@ -391,6 +466,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 f"No labware loaded in slot {source_slot!r}. "
                 f"Loaded slots: {list(self.config['loaded_labware'].keys())}"
             )
+
+        dest_str_check = str(dest_slot).strip().lower()
+        if dest_str_check != "offdeck":
+            self._check_slot_not_blocked(dest_slot)
 
         labware_id, labware_name, labware_data = self.config["loaded_labware"][source_slot]
 

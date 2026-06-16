@@ -995,11 +995,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             raise ValueError("At least one tip rack slot must be provided.")
 
         for slot in tip_rack_slots:
-            if slot not in self.config["loaded_labware"]:
+            if self._api_slot_name(slot) not in self.config["loaded_labware"]:
                 raise ValueError(
                     f"Tip rack slot {slot!r} is not loaded. Load a tiprack first."
                 )
-            labware_name = str(self.config["loaded_labware"][slot][1]).lower()
+            labware_name = str(self.config["loaded_labware"][self._api_slot_name(slot)][1]).lower()
             if "tiprack" not in labware_name:
                 self.log_warning(
                     f"Slot {slot} contains labware '{labware_name}', which may not be a tiprack."
