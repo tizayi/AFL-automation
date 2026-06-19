@@ -308,4 +308,41 @@ $(document).ready(function() {
             });
         }).catch(function(e) { console.error('Set staging areas failed:', e); });
     });
+
+    // ------------------------------------------------------------------
+    // Deck camera auto-refresh
+    // ------------------------------------------------------------------
+    var _cameraInterval = null;
+    var CAMERA_INTERVAL_MS = 5000;
+
+    function refreshCamera() {
+        var img = document.getElementById('deck-camera-img');
+        if (img) {
+            // Cache-bust so the browser doesn't serve the previous frame.
+            img.src = '/query_driver?task_name=get_snapshot&_t=' + Date.now();
+        }
+    }
+
+    function startCameraRefresh() {
+        if (_cameraInterval) return;
+        _cameraInterval = setInterval(refreshCamera, CAMERA_INTERVAL_MS);
+    }
+
+    function toggleCameraRefresh() {
+        var btn = document.getElementById('camera-pause-btn');
+        if (_cameraInterval) {
+            clearInterval(_cameraInterval);
+            _cameraInterval = null;
+            if (btn) btn.textContent = 'Resume';
+        } else {
+            startCameraRefresh();
+            if (btn) btn.textContent = 'Pause';
+        }
+    }
+
+    // Start auto-refresh if the camera panel is present in the page.
+    if (document.getElementById('deck-camera-img')) {
+        startCameraRefresh();
+    }
 });
+

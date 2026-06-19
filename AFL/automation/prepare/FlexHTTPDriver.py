@@ -649,6 +649,32 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             if stored_id and not self.pipette_info[_96CH_MOUNT_KEY].get("id"):
                 self.pipette_info[_96CH_MOUNT_KEY]["id"] = stored_id
 
+    @Driver.unqueued(render_hint="precomposed_jpeg")
+    def get_snapshot(self, **kwargs):
+        """Capture a JPEG snapshot from the Flex deck camera.
+
+        Proxies ``GET /camera/picture`` on the robot and returns the raw JPEG
+        bytes.  Registered as an unqueued endpoint so the deck-view page can
+        poll it without blocking the command queue.
+
+        Returns
+        -------
+        io.BytesIO
+            A seekable byte-stream containing the JPEG image, suitable for
+            Flask's ``send_file``.
+        """
+        import io
+        response = requests.get(
+            url=f"{self.base_url}/camera/picture",
+            headers=self.headers,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Camera snapshot failed: HTTP {response.status_code} — {response.text[:200]}"
+            )
+        return io.BytesIO(response.content)
+
     def reset_deck(self):
         """Reset deck state, revert module fixtures, and clear gripper."""
         super().reset_deck()
