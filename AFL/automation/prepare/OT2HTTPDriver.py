@@ -2502,12 +2502,18 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # Run doesn't exist, create a new one
                 return self._create_run()
 
-            # Check run state — only "idle", "running", and "paused" accept new setup
-            # commands.  Any other state (terminal, transitional, error-recovery, door-blocked,
-            # finishing, stop-requested, …) will reject commands, so treat them all as
-            # requiring a fresh run.
+            # Check run state.
+            # - "idle", "running", "paused": accept new setup commands → keep.
+            # - "blocked-by-open-door": transient; the run is still valid once
+            #   the door is closed, so raise a clear error rather than nuking
+            #   the run and forcing a full deck reload.
+            # - Everything else (terminal / error states): recreate the run.
             run_data = response.json()["data"]
             current_state = run_data.get("status")
+            if current_state == "blocked-by-open-door":
+                raise RuntimeError(
+                    "Robot door is open — close the door and retry the command."
+                )
             if current_state not in ("idle", "running", "paused"):
                 # Run is not in a usable state, create a new one
                 self.log_info(
