@@ -268,10 +268,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 if not serial:
                     continue
                 # physicalPort.slot is the Flex slot string, e.g. "D1"
-                slot = (
-                    module.get("physicalPort", {}).get("slot")
-                    or module.get("location", {}).get("slotName")
-                )
+                slot = module.get("moduleOffset", {}).get("slot")
                 if slot:
                     cutout_id = f"cutout{slot}"
                     self._module_serials[cutout_id] = serial
@@ -279,6 +276,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                         f"Module serial cached: {cutout_id} → {serial} "
                         f"({module.get('moduleModel', module.get('moduleType', '?'))})"
                     )
+            print(self._module_serials)
         except Exception as e:  # noqa: BLE001 — best-effort, don't block startup
             self.log_warning(f"_update_modules: {e}; serial numbers will be omitted.")
 
