@@ -15,6 +15,13 @@ async function login() {
     return token;
 }
 
+// Clear the cached token and show an error alert.
+// On 401 the token has expired; clearing it forces re-login on the next action.
+function ajaxError(xhr, msg) {
+    if (xhr.status === 401) { token = null; }
+    alert((msg || 'Error') + ': ' + xhr.responseText);
+}
+
 const labwareChoices = (window.OT2DeckData && window.OT2DeckData.labwareChoices) || {};
 
 var _MODULE_NAMES = ['heaterShakerModuleV1', 'thermocyclerModuleV2', 'magneticBlockV1', 'temperatureModuleV2', 'absorbanceReaderV1'];
@@ -47,9 +54,9 @@ function showLabwareOptions(slot) {
                         headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
                         data: JSON.stringify({task_name: task, name: lw, slot: slot}),
                         success: function() { setTimeout(function() { location.reload(); }, 500); },
-                        error: function(xhr) { alert('Error: ' + xhr.responseText); }
+                        error: function(xhr) { ajaxError(xhr); }
                     });
-                });
+                }).catch(function(e) { console.error('Load labware failed:', e); });
                 $(this).dialog('destroy').remove();
             },
             'Cancel': function() { $(this).dialog('destroy').remove(); }
@@ -65,9 +72,9 @@ function resetTipracks(mount) {
             headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
             data: JSON.stringify({task_name: 'reset_tipracks', mount: mount}),
             success: function() { location.reload(); },
-            error: function(xhr) { alert('Error: ' + xhr.responseText); }
+            error: function(xhr) { ajaxError(xhr); }
         });
-    });
+    }).catch(function(e) { console.error('Reset tipracks failed:', e); });
 }
 
 function loadGripper() {
@@ -78,9 +85,9 @@ function loadGripper() {
             headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
             data: JSON.stringify({task_name: 'load_gripper'}),
             success: function() { location.reload(); },
-            error: function(xhr) { alert('Error loading gripper: ' + xhr.responseText); }
+            error: function(xhr) { ajaxError(xhr, 'Error loading gripper'); }
         });
-    });
+    }).catch(function(e) { console.error('Load gripper failed:', e); });
 }
 
 function openMoveLabwareDialog(sourceSlot, labwareName) {
@@ -138,9 +145,9 @@ function moveLabware(sourceSlot, destSlot, useGripper) {
             headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
             data: JSON.stringify({task_name: 'move_labware', source_slot: sourceSlot, dest_slot: destSlot, use_gripper: useGripper}),
             success: function() { setTimeout(function() { location.reload(); }, 800); },
-            error: function(xhr) { alert('Move failed: ' + xhr.responseText); }
+            error: function(xhr) { ajaxError(xhr, 'Move failed'); }
         });
-    });
+    }).catch(function(e) { console.error('Move labware failed:', e); });
 }
 
 function openPrepTargetDialog(slot, targets) {
@@ -221,9 +228,9 @@ function appendPrepTargets(targets) {
             headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
             data: JSON.stringify({task_name: 'add_prep_targets', targets: t, reset: false}),
             success: function() { location.reload(); },
-            error: function(xhr) { alert('Error: ' + xhr.responseText); }
+            error: function(xhr) { ajaxError(xhr); }
         });
-    });
+    }).catch(function(e) { console.error('Append prep targets failed:', e); });
 }
 
 function setPrepTargets(targets) {
@@ -235,9 +242,9 @@ function setPrepTargets(targets) {
             headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
             data: JSON.stringify({task_name: 'add_prep_targets', targets: t, reset: true}),
             success: function() { location.reload(); },
-            error: function(xhr) { alert('Error: ' + xhr.responseText); }
+            error: function(xhr) { ajaxError(xhr); }
         });
-    });
+    }).catch(function(e) { console.error('Set prep targets failed:', e); });
 }
 
 $(document).ready(function() {
@@ -253,9 +260,9 @@ $(document).ready(function() {
                 headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
                 data: JSON.stringify({task_name: 'load_instrument', mount: mount, name: pipette, tip_rack_slots: tipracks}),
                 success: function() { location.reload(); },
-                error: function(xhr) { alert('Error: ' + xhr.responseText); }
+                error: function(xhr) { ajaxError(xhr); }
             });
-        });
+        }).catch(function(e) { console.error('Load instrument failed:', e); });
     });
 
     $('#reset-deck-btn').click(function() {
@@ -267,9 +274,9 @@ $(document).ready(function() {
                 headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
                 data: JSON.stringify({task_name: 'reset_deck'}),
                 success: function() { location.reload(); },
-                error: function(xhr) { alert('Error: ' + xhr.responseText); }
+                error: function(xhr) { ajaxError(xhr); }
             });
-        });
+        }).catch(function(e) { console.error('Reset deck failed:', e); });
     });
 
     // Staging area toggle — show/hide column and persist via set_staging_areas
@@ -297,8 +304,8 @@ $(document).ready(function() {
                 url: '/query_driver',
                 headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tok},
                 data: JSON.stringify({task_name: 'set_staging_areas', cutouts: cutouts}),
-                error: function(xhr) { console.warn('set_staging_areas failed:', xhr.responseText); }
+                error: function(xhr) { if (xhr.status === 401) { token = null; } console.warn('set_staging_areas failed:', xhr.responseText); }
             });
-        });
+        }).catch(function(e) { console.error('Set staging areas failed:', e); });
     });
 });

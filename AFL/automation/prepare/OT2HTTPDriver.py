@@ -1067,7 +1067,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "params": {
                         "pipetteName": pipette_name,
                         "mount": mount,
-                        "tip_racks": [self.config["loaded_labware"][str(slot)][0] for slot in tip_rack_slots],
+                        "tip_racks": [self.config["loaded_labware"][self._api_slot_name(slot)][0] for slot in tip_rack_slots],
                     },
                     "intent": "setup",
                 }
@@ -1909,7 +1909,16 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 },
             )
 
-            
+            # If the run is no longer active (race condition: run expired between the status
+            # check and this POST), clear run_id so the *next* call to _ensure_run_exists
+            # will create a fresh run instead of retrying against the dead run.
+            if command_response.status_code in (404, 409) and check_run_status:
+                self.log_warning(
+                    f"Run {run_id} returned HTTP {command_response.status_code} "
+                    "(run no longer active); clearing run_id — retry the command"
+                )
+                self.run_id = None
+
             self._check_cmd_success(command_response)
 
             command_data = command_response.json()["data"]
@@ -2493,11 +2502,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # Run doesn't exist, create a new one
                 return self._create_run()
 
-            # Check run state
+            # Check run state — only "idle", "running", and "paused" accept new setup
+            # commands.  Any other state (terminal, transitional, error-recovery, door-blocked,
+            # finishing, stop-requested, …) will reject commands, so treat them all as
+            # requiring a fresh run.
             run_data = response.json()["data"]
             current_state = run_data.get("status")
-            if current_state in ["failed", "error", "succeeded", "stopped"]:
-                # Run is in a terminal state, create a new one
+            if current_state not in ("idle", "running", "paused"):
+                # Run is not in a usable state, create a new one
+                self.log_info(
+                    f"Run {self.run_id} is in state {current_state!r}; creating new run"
+                )
                 return self._create_run()
 
             return self.run_id

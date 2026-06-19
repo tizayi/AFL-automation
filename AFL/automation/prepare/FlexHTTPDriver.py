@@ -125,6 +125,20 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         "flex_96channel_1000": "1000ul",
     }
 
+    # Maps a trashBinAdapter cutout ID to the addressable area name used when
+    # dropping tips.  Covers all 8 non-center column positions where the trash
+    # bin can legally be placed on the Flex deck.
+    _TRASH_CUTOUT_TO_AREA = {
+        "cutoutA1": "movableTrashA1",
+        "cutoutB1": "movableTrashB1",
+        "cutoutC1": "movableTrashC1",
+        "cutoutD1": "movableTrashD1",
+        "cutoutA3": "movableTrashA3",
+        "cutoutB3": "movableTrashB3",
+        "cutoutC3": "movableTrashC3",
+        "cutoutD3": "movableTrashD3",
+    }
+
     # Only declare defaults that are NEW or DIFFERENT from OT2HTTPDriver.
     # gather_defaults() walks the MRO and merges all class-level defaults dicts
     # automatically, so inherited keys do not need to be repeated here.
@@ -184,6 +198,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         self.headers = {"Opentrons-Version": self.API_VERSION}
         super()._initialize_robot()
         self._home_if_needed()
+        self._update_modules()
         self._apply_deck_configuration()
         self._autodetect_trash_area()
 
@@ -219,6 +234,53 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         except Exception as e:
             self.log_warning(f"Motor engagement check failed ({e}); homing to be safe.")
             self.home()
+
+    def _update_modules(self):
+        """Query ``GET /modules`` and cache each attached module's serial number.
+
+        Builds ``self._module_serials``, a dict mapping cutout ID
+        (e.g. ``"cutoutD1"``) to serial number string.  This is used by
+        :meth:`_apply_deck_configuration` to inject
+        ``opentronsModuleSerialNumber`` into the deck-config payload so the
+        robot associates each fixture with the specific physical module unit
+        actually attached to that slot.
+
+        The Opentrons ``/modules`` response includes a ``physicalPort`` field
+        with a ``slot`` value that maps directly to the Flex slot name
+        (e.g. ``"D1"``).  We derive the cutout ID by prefixing ``"cutout"``.
+        """
+        self._module_serials = {}  # cutoutId -> serialNumber
+        try:
+            response = requests.get(
+                url=f"{self.base_url}/modules",
+                headers=self.headers,
+                timeout=5,
+            )
+            if response.status_code != 200:
+                self.log_warning(
+                    f"Could not fetch module list (HTTP {response.status_code}); "
+                    "serial numbers will be omitted from deck configuration."
+                )
+                return
+
+            for module in response.json().get("data", []):
+                serial = module.get("serialNumber")
+                if not serial:
+                    continue
+                # physicalPort.slot is the Flex slot string, e.g. "D1"
+                slot = (
+                    module.get("physicalPort", {}).get("slot")
+                    or module.get("location", {}).get("slotName")
+                )
+                if slot:
+                    cutout_id = f"cutout{slot}"
+                    self._module_serials[cutout_id] = serial
+                    self.log_info(
+                        f"Module serial cached: {cutout_id} → {serial} "
+                        f"({module.get('moduleModel', module.get('moduleType', '?'))})"
+                    )
+        except Exception as e:  # noqa: BLE001 — best-effort, don't block startup
+            self.log_warning(f"_update_modules: {e}; serial numbers will be omitted.")
 
     def _autodetect_trash_area(self):
         """Set TRASH_ADDRESSABLE_AREA from the deck configuration.
@@ -332,12 +394,30 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             self.log_info("No deck configuration defined; skipping.")
             return
 
-        self.log_info(f"Applying deck configuration: {deck_config}")
+        # Inject module serial numbers discovered at startup.  The robot uses
+        # opentronsModuleSerialNumber to match the fixture to a specific physical
+        # unit, which is required when multiple modules of the same type could
+        # theoretically be present.  We never persist serials to config — they
+        # are always fetched live from GET /modules.
+        module_serials = getattr(self, "_module_serials", {})
+        enriched_config = []
+        _module_fixture_ids = set(_MODULE_FIXTURE_IDS.values()) | {"thermocyclerModuleV2"}
+        for entry in deck_config:
+            if entry.get("cutoutFixtureId") in _module_fixture_ids:
+                serial = module_serials.get(entry["cutoutId"])
+                if serial:
+                    enriched_entry = dict(entry)
+                    enriched_entry["opentronsModuleSerialNumber"] = serial
+                    enriched_config.append(enriched_entry)
+                    continue
+            enriched_config.append(entry)
+
+        self.log_info(f"Applying deck configuration: {enriched_config}")
 
         response = requests.put(
             url=f"{self.base_url}/deck_configuration",
             headers=self.headers,
-            json={"data": {"cutoutFixtures": deck_config}},
+            json={"data": {"cutoutFixtures": enriched_config}},
         )
 
         if response.status_code not in (200, 201):
@@ -659,9 +739,33 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ``loadModule`` command.  This override swaps the plain slot fixture for
         the module fixture, re-applies the deck configuration, then delegates
         to the parent implementation.
+
+        If ``_update_modules()`` has been called at startup and the requested
+        slot does not contain a physically attached module, a clear
+        ``ValueError`` is raised before any HTTP call is made.
         """
         flex_slot = self._normalize_slot(slot)
         cutout_id = f"cutout{flex_slot}"
+
+        # Cross-check against the live module list gathered at startup.
+        # _module_serials maps cutoutId → serial for every physically attached
+        # module.  If we have that data and the slot isn't in it, the user has
+        # nominated the wrong slot — tell them now rather than letting the robot
+        # return an opaque ModuleNotAttachedError.
+        module_serials = getattr(self, "_module_serials", {})
+        if module_serials:  # only validate when we have live data
+            fixture_id = _MODULE_FIXTURE_IDS.get(name)
+            if fixture_id and cutout_id not in module_serials:
+                attached = {
+                    cid: self._normalize_slot(cid.removeprefix("cutout"))
+                    for cid in module_serials
+                }
+                raise ValueError(
+                    f"No {name!r} detected at slot {flex_slot!r} (cutout {cutout_id!r}). "
+                    f"Physically attached modules are at slots: "
+                    f"{sorted(attached.values())}. "
+                    "Check the slot argument or verify the module is connected."
+                )
 
         if name == "thermocyclerModuleV2":
             # Thermocycler always occupies cutoutA1 (behind) and cutoutB1 (primary),
