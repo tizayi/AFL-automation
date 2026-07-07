@@ -36,10 +36,6 @@ FLEX_LABWARE_OPTIONS = {
     "absorbanceReaderV1":                         "Absorbance Reader",
 }
 
-# Staging slots — enabled when the deck config includes a staging-area fixture.
-_STAGING_SLOTS = {
-    "A4": "A4", "B4": "B4", "C4": "C4", "D4": "D4",
-}
 
 # Cutout IDs that enable the staging column.
 # Includes the combined staging+waste-chute fixture variants.

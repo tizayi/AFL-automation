@@ -664,7 +664,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             Flask's ``send_file``.
         """
         import io
-        response = requests.get(
+        response = requests.post(
             url=f"{self.base_url}/camera/picture",
             headers=self.headers,
             timeout=10,
