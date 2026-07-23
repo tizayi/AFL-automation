@@ -47,14 +47,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def __init__(self, overrides=None):
         self.app = None
+        self.name = "OT2_HTTP_Driver"
         Driver.__init__(
             self,
-            name="OT2_HTTP_Driver",
+            name=self.name,
             defaults=self.gather_defaults(),
             overrides=overrides,
         )
-        self.name = "OT2_HTTP_Driver"
-
+        
         # Initialize state variables
         self.session_id = None
         self.protocol_id = None

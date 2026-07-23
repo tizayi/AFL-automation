@@ -310,14 +310,66 @@ $(document).ready(function() {
     });
 
     // ------------------------------------------------------------------
-    // Deck camera auto-refresh
+    // Deck camera — HLS live stream with snapshot fallback
     // ------------------------------------------------------------------
     var _cameraInterval = null;
     var CAMERA_INTERVAL_MS = 5000;
+    var _hlsInstance = null;
+
+    function startHlsStream(hlsUrl) {
+        var video = document.getElementById('deck-camera-video');
+        var img   = document.getElementById('deck-camera-img');
+        var label = document.getElementById('camera-mode-label');
+        if (!video) return false;
+
+        if (Hls.isSupported()) {
+            if (_hlsInstance) { _hlsInstance.destroy(); }
+            _hlsInstance = new Hls();
+            _hlsInstance.loadSource(hlsUrl);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.ERROR, function(event, data) {
+                if (data.fatal) {
+                    // Stream died — fall back to snapshot polling.
+                    _hlsInstance.destroy();
+                    _hlsInstance = null;
+                    video.style.display = 'none';
+                    if (img) img.style.display = '';
+                    if (label) label.textContent = 'Auto-refresh every 5 s (stream unavailable)';
+                    startCameraRefresh();
+                }
+            });
+            video.style.display = '';
+            if (img) img.style.display = 'none';
+            if (label) label.textContent = 'Live stream (HLS)';
+            return true;
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari native HLS support.
+            video.src = hlsUrl;
+            video.style.display = '';
+            if (img) img.style.display = 'none';
+            if (label) label.textContent = 'Live stream (HLS)';
+            return true;
+        }
+        return false;
+    }
+
+    function initCamera() {
+        // Ask the driver for the stream URL; fall back to snapshot polling.
+        $.ajax({
+            type: 'GET',
+            url: '/query_driver?task_name=get_stream_url',
+            success: function(data) {
+                var hlsUrl = data && data.hls;
+                if (hlsUrl && startHlsStream(hlsUrl)) return;
+                startCameraRefresh();
+            },
+            error: function() { startCameraRefresh(); }
+        });
+    }
 
     function refreshCamera() {
         var img = document.getElementById('deck-camera-img');
-        if (img) {
+        if (img && img.style.display !== 'none') {
             // Cache-bust so the browser doesn't serve the previous frame.
             img.src = '/query_driver?task_name=get_snapshot&_t=' + Date.now();
         }
@@ -330,7 +382,17 @@ $(document).ready(function() {
 
     function toggleCameraRefresh() {
         var btn = document.getElementById('camera-pause-btn');
-        if (_cameraInterval) {
+        if (_hlsInstance) {
+            // Toggle HLS stream play/pause.
+            var video = document.getElementById('deck-camera-video');
+            if (video && !video.paused) {
+                video.pause();
+                if (btn) btn.textContent = 'Resume';
+            } else if (video) {
+                video.play();
+                if (btn) btn.textContent = 'Pause';
+            }
+        } else if (_cameraInterval) {
             clearInterval(_cameraInterval);
             _cameraInterval = null;
             if (btn) btn.textContent = 'Resume';
@@ -340,9 +402,9 @@ $(document).ready(function() {
         }
     }
 
-    // Start auto-refresh if the camera panel is present in the page.
-    if (document.getElementById('deck-camera-img')) {
-        startCameraRefresh();
+    // Initialise camera when the panel is present in the page.
+    if (document.getElementById('deck-camera-img') || document.getElementById('deck-camera-video')) {
+        initCamera();
     }
 });
 

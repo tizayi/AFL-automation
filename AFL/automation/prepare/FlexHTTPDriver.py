@@ -152,7 +152,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutB2"},
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutC2"},
             {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutD2"},
-            {"cutoutFixtureId": "trashBinAdapter",       "cutoutId": "cutoutA3"},
+            {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
             {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutB3"},
             {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutC3"},
             {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutD3"},
@@ -199,7 +199,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         super()._initialize_robot()
         self._home_if_needed()
         self._update_modules()
-        self._apply_deck_configuration()
+        self._sync_deck_configuration()
         self._autodetect_trash_area()
 
     def _home_if_needed(self):
@@ -375,6 +375,57 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         per-run registration, so this is a no-op.
         """
         pass
+
+    def _sync_deck_configuration(self):
+        """Read the robot's current deck configuration, store it, then push it back.
+
+        Uses ``GET /deck_configuration`` to fetch whatever the robot currently
+        has (e.g. set via the Opentrons App) and adopts it as the working
+        configuration.  Falls back to the AFL defaults already in
+        ``self.config["deck_configuration"]`` if the GET fails or returns an
+        empty fixture list.
+
+        After syncing the in-memory config, ``_apply_deck_configuration`` is
+        called unconditionally so that module serial numbers are always injected
+        before the first run is created.
+        """
+        try:
+            response = requests.get(
+                url=f"{self.base_url}/deck_configuration",
+                headers=self.headers,
+                timeout=5,
+            )
+            if response.status_code == 200:
+                robot_fixtures = (
+                    response.json().get("data", {}).get("cutoutFixtures", [])
+                )
+                if robot_fixtures:
+                    # Strip opentronsModuleSerialNumber — we re-inject live
+                    # serials from _module_serials inside _apply_deck_configuration.
+                    cleaned = [
+                        {k: v for k, v in e.items() if k != "opentronsModuleSerialNumber"}
+                        for e in robot_fixtures
+                    ]
+                    self.config["deck_configuration"] = cleaned
+                    self.config._update_history()
+                    self.log_info(
+                        f"Adopted deck configuration from robot ({len(cleaned)} fixtures)."
+                    )
+                else:
+                    self.log_info(
+                        "Robot returned an empty deck configuration; using AFL defaults."
+                    )
+            else:
+                self.log_warning(
+                    f"GET /deck_configuration returned HTTP {response.status_code}; "
+                    "using AFL defaults."
+                )
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(
+                f"Could not read robot deck configuration ({e}); using AFL defaults."
+            )
+
+        self._apply_deck_configuration()
 
     def _apply_deck_configuration(self):
         """Set the robot-level deck configuration via ``PUT /deck_configuration``.
@@ -653,7 +704,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     def get_snapshot(self, **kwargs):
         """Capture a JPEG snapshot from the Flex deck camera.
 
-        Proxies ``GET /camera/picture`` on the robot and returns the raw JPEG
+        Proxies ``POST /camera/picture`` on the robot and returns the raw JPEG
         bytes.  Registered as an unqueued endpoint so the deck-view page can
         poll it without blocking the command queue.
 
@@ -674,6 +725,46 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 f"Camera snapshot failed: HTTP {response.status_code} — {response.text[:200]}"
             )
         return io.BytesIO(response.content)
+
+    @Driver.unqueued()
+    def get_stream_url(self, **kwargs):
+        """Return the Flex deck camera live-stream URLs.
+
+        Queries ``GET /camera/stream`` and returns the ``LiveStreamData``
+        payload as a dict.
+
+        Returns
+        -------
+        dict
+            The ``data`` object from the ``/camera/stream`` response::
+
+                {
+                    "enabled": bool,   # whether the stream service is running
+                    "hls":  str,       # HLS playlist URL  (.m3u8) — usable in
+                                       # browsers via hls.js (Chrome/Firefox) or
+                                       # natively (Safari)
+                    "rtmp": str,       # RTMP ingest URL — for OBS / media servers
+                }
+
+            Pass the ``hls`` URL to an ``hls.js``-backed ``<video>`` element in
+            the FlexDeck web app for a proper live stream instead of polling
+            :meth:`get_snapshot`.
+
+        Raises
+        ------
+        RuntimeError
+            If the HTTP request fails or the camera stream is unavailable.
+        """
+        response = requests.get(
+            url=f"{self.base_url}/camera/stream",
+            headers=self.headers,
+            timeout=5,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"GET /camera/stream failed: HTTP {response.status_code} — {response.text[:200]}"
+            )
+        return response.json().get("data", response.json())
 
     def reset_deck(self):
         """Reset deck state, revert module fixtures, and clear gripper."""
