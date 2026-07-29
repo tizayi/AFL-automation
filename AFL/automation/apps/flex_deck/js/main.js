@@ -310,14 +310,72 @@ $(document).ready(function() {
     });
 
     // ------------------------------------------------------------------
-    // Deck camera — snapshot polling
+    // Deck camera — HLS live stream with snapshot polling fallback
     // ------------------------------------------------------------------
     var _cameraInterval = null;
     var CAMERA_INTERVAL_MS = 5000;
+    var _hlsInstance = null;
+
+    function startHlsStream(hlsUrl) {
+        var video = document.getElementById('deck-camera-video');
+        var img   = document.getElementById('deck-camera-img');
+        var label = document.getElementById('camera-mode-label');
+        if (!video || !hlsUrl) return false;
+
+        var onFatalError = function() {
+            if (_hlsInstance) { _hlsInstance.destroy(); _hlsInstance = null; }
+            video.style.display = 'none';
+            if (img) img.style.display = '';
+            if (label) label.textContent = 'Snapshot (stream unavailable)';
+            startCameraRefresh();
+        };
+
+        if (Hls.isSupported()) {
+            if (_hlsInstance) { _hlsInstance.destroy(); }
+            _hlsInstance = new Hls();
+            _hlsInstance.loadSource(hlsUrl);
+            _hlsInstance.attachMedia(video);
+            _hlsInstance.on(Hls.Events.ERROR, function(event, data) {
+                if (data.fatal) { onFatalError(); }
+            });
+            video.style.display = '';
+            if (img) img.style.display = 'none';
+            if (label) label.textContent = 'Live stream';
+            return true;
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            // Safari native HLS.
+            video.src = hlsUrl;
+            video.onerror = onFatalError;
+            video.style.display = '';
+            if (img) img.style.display = 'none';
+            if (label) label.textContent = 'Live stream';
+            return true;
+        }
+        return false;
+    }
+
+    function initCamera() {
+        $.ajax({
+            type: 'GET',
+            url: '/query_driver?r=get_stream_url',
+            success: function(data) {
+                var hlsUrl = data && data.hls;
+                if (hlsUrl && startHlsStream(hlsUrl)) return;
+                var label = document.getElementById('camera-mode-label');
+                if (label) label.textContent = 'Snapshot (every 5 s)';
+                startCameraRefresh();
+            },
+            error: function() {
+                var label = document.getElementById('camera-mode-label');
+                if (label) label.textContent = 'Snapshot (every 5 s)';
+                startCameraRefresh();
+            }
+        });
+    }
 
     function refreshCamera() {
         var img = document.getElementById('deck-camera-img');
-        if (img) {
+        if (img && img.style.display !== 'none') {
             img.src = '/query_driver?r=get_snapshot&_t=' + Date.now();
         }
     }
@@ -329,7 +387,16 @@ $(document).ready(function() {
 
     function toggleCameraRefresh() {
         var btn = document.getElementById('camera-pause-btn');
-        if (_cameraInterval) {
+        if (_hlsInstance) {
+            var video = document.getElementById('deck-camera-video');
+            if (video && !video.paused) {
+                video.pause();
+                if (btn) btn.textContent = 'Resume';
+            } else if (video) {
+                video.play();
+                if (btn) btn.textContent = 'Pause';
+            }
+        } else if (_cameraInterval) {
             clearInterval(_cameraInterval);
             _cameraInterval = null;
             if (btn) btn.textContent = 'Resume';
@@ -339,8 +406,8 @@ $(document).ready(function() {
         }
     }
 
-    if (document.getElementById('deck-camera-img')) {
-        startCameraRefresh();
+    if (document.getElementById('deck-camera-img') || document.getElementById('deck-camera-video')) {
+        initCamera();
     }
 });
 

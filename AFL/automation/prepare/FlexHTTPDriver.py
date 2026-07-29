@@ -371,10 +371,56 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     def _after_run_created(self, run_id):
         """Hook called by OT2HTTPDriver._create_run after a new run is created.
 
-        In API v4+ the gripper is implicitly available and requires no
-        per-run registration, so this is a no-op.
+        Enables the camera live-stream service now that a run exists.  With the
+        Opentrons robot-server patched to allow streaming in IDLE state, calling
+        ``POST /camera`` here (after the run is current and IDLE) is sufficient
+        to start ``opentrons-live-stream`` and make the HLS URL reachable.
+
+        .. note::
+            This requires the Opentrons robot-server to have
+            ``EngineStatus.IDLE`` removed from the stream-off exclusion list in
+            ``post_camera``.  Until that change is merged upstream, apply the
+            one-line patch manually on each robot:
+
+            .. code-block:: bash
+
+                ssh root@<flex-ip>
+                # Edit the post_camera router handler — remove EngineStatus.IDLE
+                # from the exclusion list, then:
+                systemctl restart opentrons-robot-server
         """
-        pass
+        self._enable_camera_stream()
+
+    def _enable_camera_stream(self):
+        """Enable the Flex deck camera live-stream via ``POST /camera``.
+
+        Must be called after a run exists (i.e. from :meth:`_after_run_created`)
+        because the Opentrons server checks ``current_run_id`` when evaluating
+        whether to start the ``opentrons-live-stream`` systemd service.
+
+        Failures are logged as warnings so that AFL can still operate with a
+        robot that has no camera or a broken camera service.
+        """
+        try:
+            response = requests.post(
+                url=f"{self.base_url}/camera",
+                headers=self.headers,
+                json={"data": {
+                    "cameraEnabled": True,
+                    "liveStreamEnabled": True,
+                    "errorRecoveryCameraEnabled": True,
+                }},
+                timeout=10,
+            )
+            if response.status_code in (200, 201):
+                self.log_info("Camera live-stream service enabled.")
+            else:
+                self.log_warning(
+                    f"POST /camera returned HTTP {response.status_code}; "
+                    f"live stream may be unavailable: {response.text[:200]}"
+                )
+        except Exception as e:  # noqa: BLE001
+            self.log_warning(f"Could not enable camera live-stream ({e}); continuing.")
 
     def _sync_deck_configuration(self):
         """Read the robot's current deck configuration, store it, then push it back.
@@ -725,6 +771,46 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 f"Camera snapshot failed: HTTP {response.status_code} — {response.text[:200]}"
             )
         return io.BytesIO(response.content)
+
+    @Driver.unqueued()
+    def get_stream_url(self, **kwargs):
+        """Return the Flex deck camera live-stream URLs.
+
+        Queries ``GET /camera/stream`` and returns the ``LiveStreamData``
+        payload as a dict.  This is a read-only call and does not affect
+        stream state.
+
+        Returns
+        -------
+        dict
+            The ``data`` object from the ``/camera/stream`` response::
+
+                {
+                    "enabled": bool,   # whether the stream service is running
+                    "hls":  str,       # relative or absolute HLS playlist URL
+                    "rtmp": str,       # RTMP ingest URL
+                }
+
+        Raises
+        ------
+        RuntimeError
+            If the HTTP request fails.
+        """
+        response = requests.get(
+            url=f"{self.base_url}/camera/stream",
+            headers=self.headers,
+            timeout=5,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"GET /camera/stream failed: HTTP {response.status_code} — {response.text[:200]}"
+            )
+        data = response.json().get("data", response.json())
+        # Make the HLS URL absolute so the browser can use it directly.
+        hls = data.get("hls", "")
+        if hls and not hls.startswith("http"):
+            data["hls"] = f"{self.base_url}{hls}"
+        return data
 
     def reset_deck(self):
         """Reset deck state, revert module fixtures, and clear gripper."""
