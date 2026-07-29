@@ -140,22 +140,15 @@
 </div>
 
 {# --- Deck camera panel ------------------------------------------------- #}
-<script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
 <div style="text-align:center; margin-top:24px; margin-bottom:16px;">
   <div style="font-weight:bold; font-size:14px; margin-bottom:8px;">Deck Camera</div>
-  {# HLS live stream — shown when stream is available #}
-  <video id="deck-camera-video" autoplay muted playsinline
-         style="max-width:480px; width:100%; border-radius:8px; border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,0.08); display:none;">
-  </video>
-  {# Snapshot fallback — shown when HLS stream is unavailable #}
   <img id="deck-camera-img"
-       src="/query_driver?task_name=get_snapshot"
+       src="/query_driver?r=get_snapshot"
        alt="Camera unavailable"
        style="max-width:480px; width:100%; border-radius:8px; border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,0.08);"
        onerror="this.style.opacity='0.3';">
   <div style="margin-top:8px;">
     <button id="camera-pause-btn" onclick="toggleCameraRefresh()" style="font-size:12px;">Pause</button>
-    <span id="camera-mode-label" style="font-size:11px; color:#888; margin-left:10px;">Auto-refresh every 5 s</span>
   </div>
 </div>
 

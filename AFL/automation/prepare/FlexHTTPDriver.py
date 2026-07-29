@@ -726,46 +726,6 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             )
         return io.BytesIO(response.content)
 
-    @Driver.unqueued()
-    def get_stream_url(self, **kwargs):
-        """Return the Flex deck camera live-stream URLs.
-
-        Queries ``GET /camera/stream`` and returns the ``LiveStreamData``
-        payload as a dict.
-
-        Returns
-        -------
-        dict
-            The ``data`` object from the ``/camera/stream`` response::
-
-                {
-                    "enabled": bool,   # whether the stream service is running
-                    "hls":  str,       # HLS playlist URL  (.m3u8) — usable in
-                                       # browsers via hls.js (Chrome/Firefox) or
-                                       # natively (Safari)
-                    "rtmp": str,       # RTMP ingest URL — for OBS / media servers
-                }
-
-            Pass the ``hls`` URL to an ``hls.js``-backed ``<video>`` element in
-            the FlexDeck web app for a proper live stream instead of polling
-            :meth:`get_snapshot`.
-
-        Raises
-        ------
-        RuntimeError
-            If the HTTP request fails or the camera stream is unavailable.
-        """
-        response = requests.get(
-            url=f"{self.base_url}/camera/stream",
-            headers=self.headers,
-            timeout=5,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"GET /camera/stream failed: HTTP {response.status_code} — {response.text[:200]}"
-            )
-        return response.json().get("data", response.json())
-
     def reset_deck(self):
         """Reset deck state, revert module fixtures, and clear gripper."""
         super().reset_deck()
