@@ -605,6 +605,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
                     ).get("value",150),
                     "channels": pipette.get("data",{}).get("channels", 1),
                         }
+            self.profile.normalize_pipette_info(self)
             if self.app is not None:
                 self.log_debug(f"Pipette information updated: {self.pipette_info}")
 
@@ -1138,6 +1139,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
         self.sent_custom_labware = {}
         self.run_id = None
         self.current_tip = None
+        self.profile.reset_deck(self)
 
     @Driver.quickbar(qb={"button_text": "Home"})
     def home(self, **kwargs):
@@ -1680,7 +1682,6 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
         slot = self.profile.normalize_slot(slot)
         self.profile.validate_slot(slot, self.config)
         self.log_debug(f"Loading module '{name}' into slot '{slot}'")
-        self.profile.prepare_module_load(self, name, slot)
 
         existing_module = self.config["loaded_modules"].get(slot)
         if existing_module is not None:
@@ -1702,6 +1703,8 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
                 f"contains module {existing_name!r} with ID {existing_module_id!r}. "
                 "Unload or reset the existing module before replacing it."
             )
+
+        self.profile.prepare_module_load(self, name, slot)
 
         # Ensure we have a valid run
         run_id = self._ensure_run_exists(check_run_status=check_run_status)
@@ -1833,9 +1836,9 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
             Loaded pipette identifier returned by the robot.
         """
         pipette_name = self._normalize_pipette_name(name)
-        mount = str(mount).strip().lower()
-        if mount not in {"left", "right"}:
-            raise ValueError(f"Mount must be 'left' or 'right'. Received: {mount!r}")
+        api_mount, state_mount = self.profile.instrument_mounts(pipette_name, mount)
+        if api_mount not in {"left", "right"}:
+            raise ValueError(f"Mount must be 'left' or 'right'. Received: {api_mount!r}")
         tip_rack_slots = [
             self.profile.normalize_slot(slot) for slot in listify(tip_rack_slots)
         ]
@@ -1855,7 +1858,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
         self._warn_on_tiprack_mismatch(pipette_name, tip_rack_slots)
 
         self.log_debug(
-            f"Loading pipette '{pipette_name}' on '{mount}' mount with tip_racks in slots {tip_rack_slots}"
+            f"Loading pipette '{pipette_name}' on '{state_mount}' mount with tip_racks in slots {tip_rack_slots}"
         )
 
         # Ensure we have a valid run
@@ -1868,7 +1871,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
                     "commandType": "loadPipette",
                     "params": {
                         "pipetteName": pipette_name,
-                        "mount": mount,
+                        "mount": api_mount,
                         "tip_racks": [self.config["loaded_labware"][str(slot)][0] for slot in tip_rack_slots],
                     },
                     "intent": "setup",
@@ -1895,9 +1898,9 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
             if update_pipettes:
                 self._update_pipettes()
             # Ensure pipette_info entry exists before patching
-            if mount not in self.pipette_info:
-                self.pipette_info[mount] = {}
-            self.pipette_info[mount][
+            if state_mount not in self.pipette_info:
+                self.pipette_info[state_mount] = {}
+            self.pipette_info[state_mount][
                 "id"
             ] = pipette_id  # patch the correct pipette id to the pipette_info dict
 
@@ -1916,7 +1919,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
                 self.log_warning(f"No valid tip racks found in slots {tip_rack_slots}")
 
             # Store the instrument information 
-            self.config["loaded_instruments"][mount] = {
+            self.config["loaded_instruments"][state_mount] = {
                 "name": pipette_name,
                 "pipette_id": pipette_id,
                 "tip_racks": tip_racks,
@@ -1924,22 +1927,22 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
 
             # If not reloading, initialize available tips for this mount
             if not reload:
-                self.config["available_tips"][mount] = []
+                self.config["available_tips"][state_mount] = []
                 for tiprack in tip_racks:
                     for well in TIPRACK_WELLS:
-                        self.config["available_tips"][mount].append((tiprack, well))
+                        self.config["available_tips"][state_mount].append((tiprack, well))
     
             # Verify that there's actually a pipette in this mount
-            if mount not in self.pipette_info or self.pipette_info[mount] is None:
+            if state_mount not in self.pipette_info or self.pipette_info[state_mount] is None:
                 self.log_warning(
-                    f"No physical pipette detected in {mount} mount, but pipette information stored"
+                    f"No physical pipette detected in {state_mount} mount, but pipette information stored"
                 )
 
             # Update min/max values for largest and smallest pipettes
             self._update_pipette_ranges()
 
             self.log_info(
-                f"Successfully loaded pipette '{pipette_name}' on {mount} mount with ID {pipette_id}"
+                f"Successfully loaded pipette '{pipette_name}' on {state_mount} mount with ID {pipette_id}"
             )
             self.config._update_history()
             return pipette_id
@@ -1947,6 +1950,11 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
         except (requests.exceptions.RequestException, KeyError) as e:
             self.log_error(f"Error loading pipette: {str(e)}")
             raise RuntimeError(f"Error loading pipette: {str(e)}")
+
+    @Driver.queued()
+    def configure_nozzle_layout(self, config_type="full96", **kwargs):
+        """Configure the profile-specific nozzle layout for a multi-channel pipette."""
+        return self.profile.configure_nozzle_layout(self, config_type)
 
     def _normalize_pipette_name(self, name):
         """Normalize a pipette alias to the canonical Opentrons name."""
@@ -4279,29 +4287,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def get_tip(self, mount):
         """Reserve and return the next available tip for a mount."""
-        available = list(self.config.get("available_tips", {}).get(mount, []))
-        if not available:
-            raise ValueError(f"No tips available for mount {mount}")
-
-        reserved_locations = {
-            str(location).strip().upper()
-            for location in self.config.get("reserved_stock_tips", [])
-        }
-        selected_index = None
-        for index, (tiprack_id, well_name) in enumerate(available):
-            slot = self._slot_by_labware_uuid(tiprack_id)
-            normalized_location = None if slot is None else f"{slot}{well_name}".upper()
-            if normalized_location in reserved_locations:
-                continue
-            selected_index = index
-            break
-
-        if selected_index is None:
-            raise RuntimeError(f"No unreserved tips available for {mount} mount")
-
-        tiprack_id, well_name = available.pop(selected_index)
-        self.config.setdefault("available_tips", {})[mount] = available
-        return tiprack_id, well_name
+        return self.profile.get_tip(self, mount)
 
     def _tip_status_counts(self, mount):
         """Summarize general and reserved tip availability for a mount.

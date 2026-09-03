@@ -91,6 +91,28 @@ class RobotProfile(ABC):
         """Apply robot-specific deck preparation before loading a module."""
 
     @abstractmethod
+    def instrument_mounts(
+        self, pipette_name: str, requested_mount: str
+    ) -> Tuple[str, str]:
+        """Return the API mount and persistent state mount for a pipette."""
+
+    @abstractmethod
+    def normalize_pipette_info(self, driver) -> None:
+        """Normalize API-reported pipette metadata for persistent state."""
+
+    @abstractmethod
+    def get_tip(self, driver, mount: str) -> Tuple[str, str]:
+        """Reserve and return the next tip for a profile-specific mount."""
+
+    @abstractmethod
+    def configure_nozzle_layout(self, driver, config_type: str) -> str:
+        """Configure an optional multi-channel pipette nozzle layout."""
+
+    @abstractmethod
+    def reset_deck(self, driver) -> None:
+        """Clear robot-specific persistent state after a generic deck reset."""
+
+    @abstractmethod
     def configure_startup(self, driver) -> None:
         """Apply robot-specific startup behavior after connecting."""
 
@@ -153,6 +175,40 @@ class OT2Profile(RobotProfile):
     def prepare_module_load(self, driver, module_name: str, slot: str) -> None:
         return None
 
+    def instrument_mounts(
+        self, pipette_name: str, requested_mount: str
+    ) -> Tuple[str, str]:
+        mount = str(requested_mount).strip().lower()
+        return mount, mount
+
+    def normalize_pipette_info(self, driver) -> None:
+        return None
+
+    def get_tip(self, driver, mount: str) -> Tuple[str, str]:
+        available = list(driver.config.get("available_tips", {}).get(mount, []))
+        if not available:
+            raise ValueError(f"No tips available for mount {mount}")
+
+        reserved_locations = {
+            str(location).strip().upper()
+            for location in driver.config.get("reserved_stock_tips", [])
+        }
+        for index, (tiprack_id, well_name) in enumerate(available):
+            slot = driver._slot_by_labware_uuid(tiprack_id)
+            location = None if slot is None else f"{slot}{well_name}".upper()
+            if location not in reserved_locations:
+                driver.config.setdefault("available_tips", {})[mount] = (
+                    available[:index] + available[index + 1:]
+                )
+                return tiprack_id, well_name
+        raise RuntimeError(f"No unreserved tips available for {mount} mount")
+
+    def configure_nozzle_layout(self, driver, config_type: str) -> str:
+        raise NotImplementedError("OT2 does not support configurable nozzle layouts.")
+
+    def reset_deck(self, driver) -> None:
+        return None
+
     def configure_startup(self, driver) -> None:
         return None
 
@@ -197,6 +253,13 @@ class FlexProfile(RobotProfile):
         "flex_8channel_50": "50ul",
         "flex_8channel_1000": "1000ul",
         "flex_96channel_1000": "1000ul",
+    }
+
+    _96_CHANNEL_MOUNT = "96channel"
+    _NOZZLE_LAYOUT_PARAMS = {
+        "full96": {"primaryNozzle": "A1", "frontRightNozzle": "H12", "style": "ALL"},
+        "column": {"primaryNozzle": "A1", "frontRightNozzle": "H1", "style": "COLUMN"},
+        "single": {"primaryNozzle": "A1", "frontRightNozzle": "A1", "style": "SINGLE"},
     }
 
     def normalize_slot(self, slot: Union[str, int]) -> str:
@@ -332,6 +395,91 @@ class FlexProfile(RobotProfile):
         driver.config["deck_configuration"] = deck_configuration
         driver.config._update_history()
         self._apply_deck_configuration(driver, module_serials)
+
+    def instrument_mounts(
+        self, pipette_name: str, requested_mount: str
+    ) -> Tuple[str, str]:
+        if "96channel" in pipette_name:
+            return "left", self._96_CHANNEL_MOUNT
+        mount = str(requested_mount).strip().lower()
+        return mount, mount
+
+    def normalize_pipette_info(self, driver) -> None:
+        left_pipette = driver.pipette_info.get("left")
+        if left_pipette and "96channel" in left_pipette.get("name", ""):
+            driver.pipette_info[self._96_CHANNEL_MOUNT] = driver.pipette_info.pop("left")
+            stored = driver.config.get("loaded_instruments", {}).get(
+                self._96_CHANNEL_MOUNT, {}
+            )
+            if stored.get("pipette_id"):
+                driver.pipette_info[self._96_CHANNEL_MOUNT]["id"] = stored["pipette_id"]
+            driver.pipette_info[self._96_CHANNEL_MOUNT]["mount"] = self._96_CHANNEL_MOUNT
+
+    def get_tip(self, driver, mount: str) -> Tuple[str, str]:
+        if mount != self._96_CHANNEL_MOUNT:
+            return OT2Profile().get_tip(driver, mount)
+
+        available = list(driver.config.get("available_tips", {}).get(mount, []))
+        if not available:
+            raise RuntimeError("No tip racks available for the 96-channel pipette.")
+        tiprack_id = available[0][0]
+        driver.config.setdefault("available_tips", {})[mount] = [
+            tip for tip in available if tip[0] != tiprack_id
+        ]
+        driver.config._update_history()
+        return tiprack_id, "A1"
+
+    def configure_nozzle_layout(self, driver, config_type: str) -> str:
+        if config_type not in self._NOZZLE_LAYOUT_PARAMS:
+            raise ValueError(
+                f"config_type must be one of {list(self._NOZZLE_LAYOUT_PARAMS)!r}."
+            )
+        instrument = driver.config.get("loaded_instruments", {}).get(
+            self._96_CHANNEL_MOUNT
+        )
+        if instrument is None:
+            raise RuntimeError("No 96-channel pipette loaded. Call load_instrument() first.")
+
+        run_id = driver._ensure_run_exists()
+        response = requests.post(
+            url=f"{driver.base_url}/runs/{run_id}/commands",
+            headers=driver.headers,
+            params={"waitUntilComplete": True},
+            json={
+                "data": {
+                    "commandType": "configureNozzleLayout",
+                    "params": {
+                        "pipetteId": instrument["pipette_id"],
+                        "configurationParams": self._NOZZLE_LAYOUT_PARAMS[config_type],
+                    },
+                    "intent": "setup",
+                }
+            },
+        )
+        driver._check_cmd_success(response)
+        instrument["nozzle_layout"] = config_type
+        driver.config._update_history()
+        return config_type
+
+    def reset_deck(self, driver) -> None:
+        default_fixture_by_column = {
+            "1": "singleLeftSlot",
+            "2": "singleCenterSlot",
+            "3": "stagingAreaRightSlot",
+        }
+        driver.config["loaded_gripper"] = None
+        driver.config["deck_configuration"] = [
+            {
+                "cutoutId": fixture["cutoutId"],
+                "cutoutFixtureId": default_fixture_by_column.get(
+                    fixture["cutoutId"][-1], "singleLeftSlot"
+                ),
+            }
+            if fixture.get("cutoutFixtureId") in _FLEX_MODULE_FIXTURE_IDS
+            else fixture
+            for fixture in driver.config.get("deck_configuration", [])
+        ]
+        driver.config._update_history()
 
     def configure_startup(self, driver) -> None:
         self._home_if_needed(driver)
