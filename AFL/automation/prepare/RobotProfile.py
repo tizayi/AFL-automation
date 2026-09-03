@@ -1,7 +1,7 @@
 """Robot-specific behavior for the Opentrons HTTP driver."""
 
-from abc import ABC
-from collections.abc import Mapping
+from abc import ABC, abstractmethod
+from typing import Dict, List, Mapping, Optional, Tuple, Union
 
 import requests
 
@@ -37,26 +37,34 @@ class RobotProfile(ABC):
 
     api_version: str
     robot_type: str
+    driver_name: str
+    defaults: Dict[str, object]
     pipette_name_aliases: Mapping[str, str]
     expected_tiprack_token: Mapping[str, str]
 
-    def normalize_slot(self, slot: str | int) -> str:
+    @abstractmethod
+    def normalize_slot(self, slot: Union[str, int]) -> str:
         """Return the API slot name for a user-supplied deck location."""
-        return str(slot).strip().upper()
 
+    @abstractmethod
+    def parse_well(self, location: str) -> Tuple[str, str]:
+        """Split a deck location into an API slot name and well name."""
+
+    @abstractmethod
     def normalize_pipette_name(self, pipette_name: str) -> str:
         """Return the API pipette name for an alias or canonical name."""
-        key = str(pipette_name).strip().lower()
-        return self.pipette_name_aliases.get(key, key)
 
-    def expected_tiprack_name(self, pipette_name: str) -> str | None:
+    @abstractmethod
+    def expected_tiprack_name(self, pipette_name: str) -> Optional[str]:
         """Return the expected tiprack token for a pipette, if known."""
-        return self.expected_tiprack_token.get(self.normalize_pipette_name(pipette_name))
 
-    def trash_addressable_area(self, deck_configuration: list[dict] | None = None) -> str:
+    @abstractmethod
+    def trash_addressable_area(
+        self, deck_configuration: Optional[List[dict]] = None
+    ) -> str:
         """Return the trash addressable area for the current deck."""
-        raise NotImplementedError
 
+    @abstractmethod
     def configure_startup(self, driver) -> None:
         """Apply robot-specific startup behavior after connecting."""
 
@@ -64,6 +72,8 @@ class RobotProfile(ABC):
 class OT2Profile(RobotProfile):
     api_version = "2"
     robot_type = "OT-2 Standard"
+    driver_name = "OT2_HTTP_Driver"
+    defaults = {}
     pipette_name_aliases = {
         "p10": "p10_single",
         "p10_single": "p10_single",
@@ -79,13 +89,53 @@ class OT2Profile(RobotProfile):
         "p1000_single": "1000ul",
     }
 
-    def trash_addressable_area(self, deck_configuration: list[dict] | None = None) -> str:
+    def normalize_slot(self, slot: Union[str, int]) -> str:
+        return str(slot).strip().upper()
+
+    def parse_well(self, location: str) -> Tuple[str, str]:
+        for index, character in enumerate(str(location)):
+            if character.isalpha():
+                return str(location)[:index], str(location)[index:]
+        return str(location), ""
+
+    def normalize_pipette_name(self, pipette_name: str) -> str:
+        key = str(pipette_name).strip().lower()
+        return self.pipette_name_aliases.get(key, key)
+
+    def expected_tiprack_name(self, pipette_name: str) -> Optional[str]:
+        return self.expected_tiprack_token.get(self.normalize_pipette_name(pipette_name))
+
+    def trash_addressable_area(
+        self, deck_configuration: Optional[List[dict]] = None
+    ) -> str:
         return "fixedTrash"
+
+    def configure_startup(self, driver) -> None:
+        return None
 
 
 class FlexProfile(RobotProfile):
     api_version = "4"
     robot_type = "OT-3"
+    driver_name = "FlexHTTPDriver"
+    defaults = {
+        "deck_configuration": [
+            {"cutoutFixtureId": "singleLeftSlot", "cutoutId": "cutoutA1"},
+            {"cutoutFixtureId": "singleLeftSlot", "cutoutId": "cutoutB1"},
+            {"cutoutFixtureId": "singleLeftSlot", "cutoutId": "cutoutC1"},
+            {"cutoutFixtureId": "singleLeftSlot", "cutoutId": "cutoutD1"},
+            {"cutoutFixtureId": "singleCenterSlot", "cutoutId": "cutoutA2"},
+            {"cutoutFixtureId": "singleCenterSlot", "cutoutId": "cutoutB2"},
+            {"cutoutFixtureId": "singleCenterSlot", "cutoutId": "cutoutC2"},
+            {"cutoutFixtureId": "singleCenterSlot", "cutoutId": "cutoutD2"},
+            {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutB3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutC3"},
+            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutD3"},
+        ],
+        "loaded_gripper": None,
+        "blocked_slots": [],
+    }
     pipette_name_aliases = {
         "flex_1channel_50": "flex_1channel_50",
         "flex_1channel_1000": "flex_1channel_1000",
@@ -106,11 +156,29 @@ class FlexProfile(RobotProfile):
         "flex_96channel_1000": "1000ul",
     }
 
-    def normalize_slot(self, slot: str | int) -> str:
-        value = super().normalize_slot(slot)
+    def normalize_slot(self, slot: Union[str, int]) -> str:
+        value = str(slot).strip().upper()
         return _OT2_TO_FLEX_SLOT.get(value, value)
 
-    def trash_addressable_area(self, deck_configuration: list[dict] | None = None) -> str:
+    def parse_well(self, location: str) -> Tuple[str, str]:
+        value = str(location).strip().upper()
+        if len(value) >= 3 and value[0].isalpha() and value[1].isdigit():
+            return value[:2], value[2:]
+        for index, character in enumerate(value):
+            if character.isalpha():
+                return self.normalize_slot(value[:index]), value[index:]
+        return self.normalize_slot(value), ""
+
+    def normalize_pipette_name(self, pipette_name: str) -> str:
+        key = str(pipette_name).strip().lower()
+        return self.pipette_name_aliases.get(key, key)
+
+    def expected_tiprack_name(self, pipette_name: str) -> Optional[str]:
+        return self.expected_tiprack_token.get(self.normalize_pipette_name(pipette_name))
+
+    def trash_addressable_area(
+        self, deck_configuration: Optional[List[dict]] = None
+    ) -> str:
         for fixture in deck_configuration or []:
             if fixture.get("cutoutFixtureId") != "trashBinAdapter":
                 continue
@@ -148,7 +216,7 @@ class FlexProfile(RobotProfile):
             driver.log_warning(f"Motor engagement check failed ({error}); homing to be safe.")
             driver.home()
 
-    def _get_module_serials(self, driver) -> dict[str, str]:
+    def _get_module_serials(self, driver) -> Dict[str, str]:
         try:
             response = requests.get(
                 url=f"{driver.base_url}/modules", headers=driver.headers, timeout=5

@@ -12,6 +12,7 @@ import json
 import shutil
 from pathlib import Path
 from itertools import combinations_with_replacement
+from typing import Optional
 
 import numpy as np
 import lazy_loader as lazy
@@ -19,14 +20,24 @@ import lazy_loader as lazy
 from math import ceil, floor
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2DeckWebAppMixin import OT2DeckWebAppMixin
+from AFL.automation.prepare.RobotProfile import OT2Profile, RobotProfile
 from AFL.automation.shared.utilities import listify
+
+
+
+
+
+
+
+
 
 # Add this constant at the top of the file, after the imports
 TIPRACK_WELLS = [f"{row}{col}" for col in range(1, 13) for row in "ABCDEFGH"]
 FIXED_TRASH_ADDRESSABLE_AREA = "fixedTrash"
 
-class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
-    """HTTP-backed Opentrons OT-2 driver.
+
+class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
+    """HTTP-backed Opentrons OT2 and Flex.
 
     This driver wraps the Opentrons HTTP API and persists deck state in the
     AFL driver configuration so labware, modules, instruments, tip usage, and
@@ -81,7 +92,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["enable_deck_stream"] = True
     defaults["deck_stream_video_fps"] = 1
 
-    def __init__(self, overrides=None):
+    def __init__(self, overrides=None, profile: Optional[RobotProfile] = None):
         """Initialize the OT-2 HTTP driver.
 
         Parameters
@@ -95,14 +106,17 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         >>> driver.base_url
         'http://127.0.0.1:31950'
         """
+        self.profile = profile if profile is not None else OT2Profile()
         self.app = None
+        defaults = self.gather_defaults()
+        defaults.update(copy.deepcopy(self.profile.defaults))
         Driver.__init__(
             self,
-            name="OT2_HTTP_Driver",
-            defaults=self.gather_defaults(),
+            name=self.profile.driver_name,
+            defaults=defaults,
             overrides=overrides,
         )
-        self.name = "OT2_HTTP_Driver"
+        self.name = self.profile.driver_name
 
         # Initialize state variables
         self.session_id = None
@@ -137,7 +151,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
         # Base URL for HTTP requests
         self.base_url = f"http://{self.config['robot_ip']}:{self.config['robot_port']}"
-        self.headers = {"Opentrons-Version": "2"}
+        self.headers = {"Opentrons-Version": self.profile.api_version}
 
         # Initialize the robot connection
         self._initialize_robot()
@@ -544,6 +558,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             # Get attached pipettes
             self._update_pipettes()
+            self.profile.configure_startup(self)
         except requests.exceptions.RequestException as e:
             self.log_error(f"Error connecting to robot: {str(e)}")
             raise ConnectionError(
@@ -1177,14 +1192,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tuple
             Two-item tuple ``(slot, well)``.
         """
-        # Default value in case no alphabetic character is found
-        i = 0
-        for i, loc_part in enumerate(list(loc)):
-            if loc_part.isalpha():
-                break
-        slot = loc[:i]
-        well = loc[i:]
-        return slot, well
+        return self.profile.parse_well(loc)
 
     def get_wells(self, locs):
         """Convert deck locations into validated HTTP API well descriptors.
@@ -1418,6 +1426,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         str
             Loaded labware identifier returned by the robot.
         """
+        slot = self.profile.normalize_slot(slot)
         self.log_debug(f"Loading labware '{name}' into slot '{slot}'")
 
         # Ensure we have a valid run
@@ -1601,7 +1610,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         str
             Loaded module identifier returned by the robot.
         """
-        slot = str(slot)
+        slot = self.profile.normalize_slot(slot)
         self.log_debug(f"Loading module '{name}' into slot '{slot}'")
 
         existing_module = self.config["loaded_modules"].get(slot)
@@ -1758,7 +1767,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         mount = str(mount).strip().lower()
         if mount not in {"left", "right"}:
             raise ValueError(f"Mount must be 'left' or 'right'. Received: {mount!r}")
-        tip_rack_slots = [str(slot) for slot in listify(tip_rack_slots)]
+        tip_rack_slots = [
+            self.profile.normalize_slot(slot) for slot in listify(tip_rack_slots)
+        ]
         if len(tip_rack_slots) == 0:
             raise ValueError("At least one tip rack slot must be provided.")
 
@@ -1870,9 +1881,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
     def _normalize_pipette_name(self, name):
         """Normalize a pipette alias to the canonical Opentrons name."""
-        key = str(name).strip().lower()
-        normalized = self.PIPETTE_NAME_ALIASES.get(key, key)
-        return normalized
+        return self.profile.normalize_pipette_name(name)
 
     def _warn_on_tiprack_mismatch(self, pipette_name, tip_rack_slots):
         """Warn when tiprack names appear incompatible with a pipette.
@@ -1884,7 +1893,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         tip_rack_slots : sequence of str
             Slots containing candidate tipracks.
         """
-        token = self.EXPECTED_TIPRACK_TOKEN.get(pipette_name)
+        token = self.profile.expected_tiprack_name(pipette_name)
         if token is None:
             return
         mismatched_slots = []
@@ -4107,7 +4116,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "moveToAddressableAreaForDropTip",
                 {
                     "pipetteId": pipette_id,
-                    "addressableAreaName": FIXED_TRASH_ADDRESSABLE_AREA,
+                    "addressableAreaName": self.profile.trash_addressable_area(
+                        self.config.get("deck_configuration")
+                    ),
                     "alternateDropLocation": False,
                 },
                 check_run_status=False,
@@ -4412,6 +4423,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             f.write('\n'.join(script))
             
         self.log_info(f"Generated alignment script at {filename}")
-    
+
+
+class OT2HTTPDriver(OpentronsHTTPDriver):
+    """Compatibility wrapper for the established OT-2 driver name."""
+
+    def __init__(self, overrides=None):
+        super().__init__(overrides=overrides, profile=OT2Profile())
+
+
 if __name__ == "__main__":
     from AFL.automation.shared.launcher import *
