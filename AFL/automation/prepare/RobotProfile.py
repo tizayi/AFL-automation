@@ -13,6 +13,8 @@ _OT2_TO_FLEX_SLOT = {
     "10": "A1", "11": "A2", "12": "A3",
 }
 
+_FLEX_STAGING_SLOTS = {"A4", "B4", "C4", "D4"}
+
 _FLEX_TRASH_CUTOUT_TO_AREA = {
     "cutoutA1": "movableTrashA1",
     "cutoutB1": "movableTrashB1",
@@ -31,6 +33,8 @@ _FLEX_MODULE_FIXTURE_IDS = {
     "absorbanceReaderV1",
 }
 
+_FLEX_THERMOCYCLER_CUTOUTS = {"cutoutA1", "cutoutB1"}
+
 
 class RobotProfile(ABC):
     """Encapsulate robot-family behavior used by ``OpentronsHTTPDriver``."""
@@ -45,6 +49,10 @@ class RobotProfile(ABC):
     @abstractmethod
     def normalize_slot(self, slot: Union[str, int]) -> str:
         """Return the API slot name for a user-supplied deck location."""
+
+    @abstractmethod
+    def slot_location(self, slot: Union[str, int]) -> Dict[str, str]:
+        """Return the Opentrons API location payload for a deck position."""
 
     @abstractmethod
     def parse_well(self, location: str) -> Tuple[str, str]:
@@ -63,6 +71,24 @@ class RobotProfile(ABC):
         self, deck_configuration: Optional[List[dict]] = None
     ) -> str:
         """Return the trash addressable area for the current deck."""
+
+    @abstractmethod
+    def validate_slot(self, slot: str, config: Mapping[str, object]) -> None:
+        """Raise an error when a slot cannot be used by this robot."""
+
+    @abstractmethod
+    def labware_move_strategy(
+        self, use_gripper: bool, config: Mapping[str, object]
+    ) -> str:
+        """Return the Opentrons strategy for a labware move."""
+
+    @abstractmethod
+    def load_gripper(self, driver) -> str:
+        """Detect and persist the robot gripper, if supported."""
+
+    @abstractmethod
+    def prepare_module_load(self, driver, module_name: str, slot: str) -> None:
+        """Apply robot-specific deck preparation before loading a module."""
 
     @abstractmethod
     def configure_startup(self, driver) -> None:
@@ -92,6 +118,9 @@ class OT2Profile(RobotProfile):
     def normalize_slot(self, slot: Union[str, int]) -> str:
         return str(slot).strip().upper()
 
+    def slot_location(self, slot: Union[str, int]) -> Dict[str, str]:
+        return {"slotName": self.normalize_slot(slot)}
+
     def parse_well(self, location: str) -> Tuple[str, str]:
         for index, character in enumerate(str(location)):
             if character.isalpha():
@@ -109,6 +138,20 @@ class OT2Profile(RobotProfile):
         self, deck_configuration: Optional[List[dict]] = None
     ) -> str:
         return "fixedTrash"
+
+    def validate_slot(self, slot: str, config: Mapping[str, object]) -> None:
+        return None
+
+    def labware_move_strategy(
+        self, use_gripper: bool, config: Mapping[str, object]
+    ) -> str:
+        return "manualMoveWithoutPause"
+
+    def load_gripper(self, driver) -> str:
+        raise NotImplementedError("OT2 does not support a gripper.")
+
+    def prepare_module_load(self, driver, module_name: str, slot: str) -> None:
+        return None
 
     def configure_startup(self, driver) -> None:
         return None
@@ -160,6 +203,12 @@ class FlexProfile(RobotProfile):
         value = str(slot).strip().upper()
         return _OT2_TO_FLEX_SLOT.get(value, value)
 
+    def slot_location(self, slot: Union[str, int]) -> Dict[str, str]:
+        flex_slot = self.normalize_slot(slot)
+        if flex_slot in _FLEX_STAGING_SLOTS:
+            return {"addressableAreaName": flex_slot}
+        return {"slotName": flex_slot}
+
     def parse_well(self, location: str) -> Tuple[str, str]:
         value = str(location).strip().upper()
         if len(value) >= 3 and value[0].isalpha() and value[1].isdigit():
@@ -187,9 +236,107 @@ class FlexProfile(RobotProfile):
                 return area
         return "movableTrashA3"
 
+    def validate_slot(self, slot: str, config: Mapping[str, object]) -> None:
+        blocked_slots = [
+            str(blocked_slot).strip().upper()
+            for blocked_slot in config.get("blocked_slots", [])
+        ]
+        if slot in blocked_slots:
+            raise ValueError(
+                f"Slot {slot!r} is physically inaccessible (listed in blocked_slots)."
+            )
+
+    def labware_move_strategy(
+        self, use_gripper: bool, config: Mapping[str, object]
+    ) -> str:
+        if not use_gripper:
+            return "manualMoveWithoutPause"
+        if not config.get("loaded_gripper"):
+            raise RuntimeError("Gripper is not loaded. Call load_gripper() before move_labware().")
+        return "usingGripper"
+
+    def load_gripper(self, driver) -> str:
+        response = requests.get(
+            url=f"{driver.base_url}/instruments", headers=driver.headers
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to get instruments: {response.text}")
+
+        gripper = next(
+            (
+                instrument
+                for instrument in response.json().get("data", [])
+                if instrument.get("mount") == "extension"
+            ),
+            None,
+        )
+        if gripper is None:
+            raise RuntimeError(
+                "No gripper found on the extension mount. "
+                "Ensure a gripper is physically attached to the Flex."
+            )
+
+        serial = gripper.get("serialNumber")
+        if not serial:
+            raise RuntimeError(
+                "Gripper found on the extension mount but its serialNumber is missing."
+            )
+
+        driver.config["loaded_gripper"] = {"gripper_id": serial, "serial": serial}
+        driver.config._update_history()
+        driver.log_info(f"Gripper detected with serial {serial}")
+        return serial
+
+    def prepare_module_load(self, driver, module_name: str, slot: str) -> None:
+        flex_slot = self.normalize_slot(slot)
+        cutout_id = f"cutout{flex_slot}"
+        module_fixture = module_name if module_name in _FLEX_MODULE_FIXTURE_IDS else None
+        module_serials = getattr(driver, "_module_serials", {})
+
+        if module_fixture and module_serials and cutout_id not in module_serials:
+            raise ValueError(
+                f"No {module_name!r} detected at Flex slot {flex_slot!r}."
+            )
+
+        if module_name == "thermocyclerModuleV2":
+            deck_configuration = [
+                fixture
+                for fixture in driver.config.get("deck_configuration", [])
+                if fixture.get("cutoutId") not in _FLEX_THERMOCYCLER_CUTOUTS
+            ]
+            deck_configuration.extend(
+                {
+                    "cutoutId": thermocycler_cutout,
+                    "cutoutFixtureId": "thermocyclerModuleV2",
+                }
+                for thermocycler_cutout in sorted(_FLEX_THERMOCYCLER_CUTOUTS)
+            )
+        elif module_fixture:
+            deck_configuration = []
+            replaced = False
+            for fixture in driver.config.get("deck_configuration", []):
+                if fixture.get("cutoutId") == cutout_id:
+                    deck_configuration.append(
+                        {"cutoutId": cutout_id, "cutoutFixtureId": module_fixture}
+                    )
+                    replaced = True
+                else:
+                    deck_configuration.append(fixture)
+            if not replaced:
+                deck_configuration.append(
+                    {"cutoutId": cutout_id, "cutoutFixtureId": module_fixture}
+                )
+        else:
+            return
+
+        driver.config["deck_configuration"] = deck_configuration
+        driver.config._update_history()
+        self._apply_deck_configuration(driver, module_serials)
+
     def configure_startup(self, driver) -> None:
         self._home_if_needed(driver)
         module_serials = self._get_module_serials(driver)
+        driver._module_serials = module_serials
         self._sync_deck_configuration(driver, module_serials)
 
     def _home_if_needed(self, driver) -> None:

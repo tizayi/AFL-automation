@@ -1,7 +1,7 @@
 import warnings
 
 from AFL.automation.APIServer.Driver import Driver
-from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
+from AFL.automation.prepare.OpentronsHTTPDriver import OT2HTTPDriver
 from AFL.automation.prepare.PrepareDriver import PrepareDriver, capture_task_video
 from AFL.automation.shared.utilities import listify
 from AFL.automation.shared.units import enforce_units

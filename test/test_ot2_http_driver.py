@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import requests
 
-from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
+from AFL.automation.prepare.OpentronsHTTPDriver import OT2HTTPDriver
 
 
 class DummyConfig(dict):

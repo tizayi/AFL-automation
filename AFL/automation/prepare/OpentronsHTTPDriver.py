@@ -24,13 +24,6 @@ from AFL.automation.prepare.RobotProfile import OT2Profile, RobotProfile
 from AFL.automation.shared.utilities import listify
 
 
-
-
-
-
-
-
-
 # Add this constant at the top of the file, after the imports
 TIPRACK_WELLS = [f"{row}{col}" for col in range(1, 13) for row in "ABCDEFGH"]
 FIXED_TRASH_ADDRESSABLE_AREA = "fixedTrash"
@@ -1179,6 +1172,11 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
             self.log_error(f"Error during homing: {str(e)}")
             raise RuntimeError(f"Error during homing: {str(e)}")
 
+    @Driver.unqueued()
+    def load_gripper(self):
+        """Detect and record an attached gripper when the profile supports one."""
+        return self.profile.load_gripper(self)
+
     def parse_well(self, loc):
         """Split a deck location into slot and well components.
 
@@ -1427,6 +1425,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
             Loaded labware identifier returned by the robot.
         """
         slot = self.profile.normalize_slot(slot)
+        self.profile.validate_slot(slot, self.config)
         self.log_debug(f"Loading labware '{name}' into slot '{slot}'")
 
         # Ensure we have a valid run
@@ -1516,7 +1515,7 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
                 # we need to load into a module, not a slot
                 location = {"moduleId": self.config["loaded_modules"][str(slot)][0]}
             else:
-                location = {"slotName": str(slot)}
+                location = self.profile.slot_location(slot)
                 
             # Prepare the loadLabware command
             command_dict = {
@@ -1592,7 +1591,75 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
         except (requests.exceptions.RequestException, KeyError) as e:
             self.log_error(f"Error loading labware: {str(e)}")
             raise RuntimeError(f"Error loading labware: {str(e)}")
-            
+
+    @Driver.quickbar(
+        qb={
+            "button_text": "Move Labware",
+            "params": {
+                "source_slot": {"label": "Source Slot", "type": "text", "default": "1"},
+                "dest_slot": {"label": "Dest Slot (or offDeck)", "type": "text", "default": "2"},
+                "use_gripper": {"label": "Use Gripper", "type": "bool", "default": True},
+            },
+        }
+    )
+    def move_labware(self, source_slot, dest_slot, use_gripper=True):
+        """Move loaded labware with the profile-selected Opentrons strategy."""
+        source_slot = self.profile.normalize_slot(source_slot)
+        if source_slot not in self.config["loaded_labware"]:
+            raise ValueError(
+                f"No labware loaded in slot {source_slot!r}. "
+                f"Loaded slots: {list(self.config['loaded_labware'].keys())}"
+            )
+
+        destination_is_off_deck = str(dest_slot).strip().lower() == "offdeck"
+        if destination_is_off_deck:
+            normalized_destination = "offDeck"
+            new_location = "offDeck"
+        else:
+            normalized_destination = self.profile.normalize_slot(dest_slot)
+            self.profile.validate_slot(normalized_destination, self.config)
+            new_location = self.profile.slot_location(normalized_destination)
+
+        labware_id, labware_name, labware_data = self.config["loaded_labware"][source_slot]
+        strategy = self.profile.labware_move_strategy(use_gripper, self.config)
+        run_id = self._ensure_run_exists()
+        response = requests.post(
+            url=f"{self.base_url}/runs/{run_id}/commands",
+            headers=self.headers,
+            params={"waitUntilComplete": True},
+            json={
+                "data": {
+                    "commandType": "moveLabware",
+                    "params": {
+                        "labwareId": labware_id,
+                        "newLocation": new_location,
+                        "strategy": strategy,
+                    },
+                    "intent": "setup",
+                }
+            },
+        )
+        self._check_cmd_success(response)
+
+        del self.config["loaded_labware"][source_slot]
+        if not destination_is_off_deck:
+            self.config["loaded_labware"][normalized_destination] = (
+                labware_id,
+                labware_name,
+                labware_data,
+            )
+        self.config._update_history()
+        self.log_info(
+            f"Moved '{labware_name}' from slot {source_slot} to {normalized_destination} "
+            f"(strategy: {strategy!r})"
+        )
+        return {
+            "source_slot": source_slot,
+            "dest_slot": normalized_destination,
+            "strategy": strategy,
+            "labware_id": labware_id,
+        }
+
     def load_module(self, name, slot, check_run_status=True, **kwargs):
         """Load a module into a deck slot.
 
@@ -1611,7 +1678,9 @@ class OpentronsHTTPDriver(OT2DeckWebAppMixin, Driver):
             Loaded module identifier returned by the robot.
         """
         slot = self.profile.normalize_slot(slot)
+        self.profile.validate_slot(slot, self.config)
         self.log_debug(f"Loading module '{name}' into slot '{slot}'")
+        self.profile.prepare_module_load(self, name, slot)
 
         existing_module = self.config["loaded_modules"].get(slot)
         if existing_module is not None:

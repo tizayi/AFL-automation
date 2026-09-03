@@ -1,7 +1,7 @@
 import uuid
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.shared.utilities import listify
-from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver, TIPRACK_WELLS
+from AFL.automation.prepare.OpentronsHTTPDriver import OT2HTTPDriver, TIPRACK_WELLS
 
 
 class VirtualOT2HTTPDriver(OT2HTTPDriver):
