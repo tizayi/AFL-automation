@@ -2,6 +2,8 @@ import requests
 
 from AFL.automation.loading.SampleCell import SampleCell
 from AFL.automation.APIServer.Driver import Driver
+from AFL.automation.loading.PressureController import PressureController
+from AFL.automation.loading.MultiChannelRelay import MultiChannelRelay
 from collections import defaultdict
 import warnings
 import time
@@ -38,12 +40,12 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
     defaults['ramp_load_stop_pressure'] = 7
     defaults['ramp_load_duration'] = 20
 
-    def __init__(self,pctrl,
-                      relayboard,
+    def __init__(self,pctrl: PressureController,
+                      relayboard: MultiChannelRelay,
                       digitalin=None,
-                      rinse1_tank_level=950,
-                      rinse2_tank_level=950,
-                      waste_tank_level=0,
+                      rinse1_tank_level:float=950,
+                      rinse2_tank_level:float=950,
+                      waste_tank_level:float=0,
                       load_stopper=None,
                       robot_interlock_host=None,
                       overrides=None,
@@ -186,6 +188,7 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
         if self.digitalin is not None:
             if 'DOOR' in self.digitalin.state.keys():
                 return not self.digitalin.state['DOOR']
+
         try:
             state = requests.get(self.robot_interlock_url,headers = {
         'Opentrons-Version': '2'}).json()['data']['status']
@@ -469,13 +472,13 @@ _DEFAULT_CUSTOM_CONFIG = {
                 {'_classname': 'AFL.automation.loading.PiPlatesRelay.PiPlatesRelay',
                 '_args': [        
                         {
-                                7:'arm-up',6:'arm-down',
-                                1:'rinse1',2:'rinse2',3:'blow',4:'piston-vent',5:'postsample'
+                        7:'arm-up',6:'arm-down',
+                        1:'rinse1',2:'rinse2',3:'blow',4:'piston-vent',5:'postsample'
                         }]}
                 ],
-        'digitalin': {'_classname': 'AFL.automation.loading.PiGPIO.PiGPIO',
-                        '_args': [{4:'DOOR',14:'ARM_UP',15:'ARM_DOWN'}],
-                        'pull_dir':'UP'
+            'digitalin': {'_classname': 'AFL.automation.loading.PiGPIO.PiGPIO',
+                    '_args': [{4:'DOOR',14:'ARM_UP',15:'ARM_DOWN'}],
+                    'pull_dir':'UP'
                         },
         'load_stopper': [
                 {'_classname': 'AFL.automation.loading.LoadStopperDriver.LoadStopperDriver',

@@ -70,7 +70,7 @@ class RevPiRelay(MultiChannelRelay):
         process image is continuously synchronised in the background.
     """
 
-    def __init__(self, relaylabels, autorefresh=True):
+    def __init__(self, relaylabels: dict, autorefresh: bool=True)-> None:
         self.revpimodio = lazy.load("revpimodio2", require="AFL-automation[revpi]")
 
         # labels  : {piCtory_name: logical_name}
@@ -108,7 +108,7 @@ class RevPiRelay(MultiChannelRelay):
         """Set every configured output to False (relay open / de-energised)."""
         self.setChannels({name: False for name in self.ids})
 
-    def setChannels(self, channels):
+    def setChannels(self, channels: dict[str,bool]):
         """Set one or more relay outputs.
 
         Parameters
@@ -131,7 +131,7 @@ class RevPiRelay(MultiChannelRelay):
 
             self._refresh_board_state()
 
-    def getChannels(self, asid=False):
+    def getChannels(self, asid: bool=False) -> dict[str, bool]:
         """Read the current state of all channels.
 
         Parameters
@@ -150,7 +150,7 @@ class RevPiRelay(MultiChannelRelay):
                 return {self.ids[name]: val for name, val in self.state.items()}
             return dict(self.state)
 
-    def toggleChannels(self, channels):
+    def toggleChannels(self, channels: dict[str, bool]) -> dict[str, bool]:
         """Toggle the state of the listed channels.
 
         Parameters
@@ -165,7 +165,7 @@ class RevPiRelay(MultiChannelRelay):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _refresh_board_state(self):
+    def _refresh_board_state(self) -> None:
         """Write the current software state to the RevPi process image and verify readback.
 
         Called with ``self._lock`` already held.
@@ -202,7 +202,7 @@ class RevPiRelay(MultiChannelRelay):
                     f"after 60 attempts."
                 )
 
-    def _get_mismatches(self):
+    def _get_mismatches(self) -> set:
         """Return the set of logical names whose readback does not match the desired state."""
         mismatches = set()
         for name, desired in self.state.items():
