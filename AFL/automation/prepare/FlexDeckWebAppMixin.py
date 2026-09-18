@@ -24,9 +24,11 @@ FLEX_LABWARE_OPTIONS = {
     "opentrons/opentrons_flex_96_tiprack_200ul":  "Flex 96 Tiprack 200 µL",
     "opentrons/opentrons_flex_96_tiprack_1000ul": "Flex 96 Tiprack 1000 µL",
     "opentrons/corning_96_wellplate_360ul_flat":  "Corning 96 Well Plate",
+    "opentrons/greiner_96_wellplate_323ul":        "Greiner 96 Well Plate 323 µL",
     "opentrons/nest_96_wellplate_2ml_deep":       "NEST 2 mL 96 Deep Well",
     "opentrons/nest_1_reservoir_290ml":           "NEST 290 mL Reservoir",
     "custom_beta/nest_96_wellplate_1p6ml_deep_afl": "NEST 1.6 mL Deep Well (AFL)",
+    "custom_beta/nist_pneumatic_loader":       "NIST Pneumatic Loader (slot 10 only)",
     "custom_beta/nist_6_20ml_vials":              "NIST 6 × 20 mL vial carrier",
     "custom_beta/nist_2_100ml_bottles":           "NIST 2 × 100 mL bottle carrier",
     "heaterShakerModuleV1":                       "Heater-Shaker (needs labware on top)",
@@ -69,6 +71,7 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             if cutout_id in _STAGING_CUTOUT_IDS or fixture_id in _STAGING_CUTOUT_IDS:
                 return True
         return False
+
 
     def _get_flex_slot_info(self, slot_key, compact):
         """Build the slot info dict for *slot_key* (OT2 numeric string or staging label).
@@ -253,7 +256,7 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             gripper_info=gripper_info,
             mode=mode,
             deck_data_json=json.dumps({
-                "labwareChoices": FLEX_LABWARE_OPTIONS,
+                "labwareChoices": self._labware_choices(),
                 "gripperLoaded": gripper_info is not None,
                 "allSlots": all_slots,
             }),

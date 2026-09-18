@@ -395,14 +395,14 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 if robot_fixtures:
                     # Strip opentronsModuleSerialNumber — we re-inject live
                     # serials from _module_serials inside _apply_deck_configuration.
-                    cleaned = [
-                        {k: v for k, v in e.items() if k != "opentronsModuleSerialNumber"}
-                        for e in robot_fixtures
-                    ]
-                    self.config["deck_configuration"] = cleaned
+                    # cleaned = [
+                    #     {k: v for k, v in e.items() if k != "opentronsModuleSerialNumber"}
+                    #     for e in robot_fixtures
+                    # ]
+                    self.config["deck_configuration"] = robot_fixtures
                     self.config._update_history()
                     self.log_info(
-                        f"Adopted deck configuration from robot ({len(cleaned)} fixtures)."
+                        f"Adopted deck configuration from robot ({len(robot_fixtures)} fixtures)."
                     )
                 else:
                     self.log_info(

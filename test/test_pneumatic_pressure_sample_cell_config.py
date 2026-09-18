@@ -7,12 +7,12 @@ def test_default_config_uses_labjack_and_revpi_io():
     assert pressure_controller['_args'][0]['port_to_write'] == 'TDAC4'
     assert relayboard['_classname'].endswith('RevPiRelay.RevPiRelay')
     assert relayboard['_args'][0] == {
-        'O_1': 'arm-up', 'O_2': 'arm-down', 'O_3': 'rinse1',
-        'O_4': 'rinse2', 'O_5': 'blow', 'O_6': 'piston-vent',
-        'O_7': 'postsample',
+        'O_1': 'blow', 'O_2': 'rinse1', 'O_3': 'rinse2',
+        'O_4': 'enable', 'O_7': 'arm-up', 'O_8': 'arm-down',
+        'O_14': 'postsample', 'O_13': 'piston-vent'
     }
     assert _DEFAULT_CUSTOM_CONFIG['digitalin']['_args'][0] == {
-        'I_1': 'DOOR', 'I_2': 'ARM_UP', 'I_3': 'ARM_DOWN',
+        'I_2': 'ARM_UP', 'I_3': 'ARM_DOWN',
     }
 
 
