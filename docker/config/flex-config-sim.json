@@ -12,9 +12,6 @@
         "overrides": {
           "robot_ip": "flex-sim",
           "robot_port": "31950",
-          "deck_configuration": [
-            {"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"}
-          ],
           "stocks": [],
           "stock_mix_order": [],
           "deck": {}

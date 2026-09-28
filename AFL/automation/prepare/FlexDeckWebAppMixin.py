@@ -18,7 +18,10 @@ from jinja2 import Template
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2DeckWebAppMixin import OT2DeckWebAppMixin
 
-# Flex-specific labware options shown in the load-labware dialog.
+# Built-in Opentrons labware shown in the load-labware dialog.  The robot has
+# no endpoint listing its built-in definitions, so this list is curated by hand.
+# Custom labware is not listed here; it is read from the custom labware
+# directory by FlexDeckWebAppMixin._labware_choices().
 FLEX_LABWARE_OPTIONS = {
     "opentrons/opentrons_flex_96_tiprack_50ul":   "Flex 96 Tiprack 50 µL",
     "opentrons/opentrons_flex_96_tiprack_200ul":  "Flex 96 Tiprack 200 µL",
@@ -27,10 +30,10 @@ FLEX_LABWARE_OPTIONS = {
     "opentrons/greiner_96_wellplate_323ul":        "Greiner 96 Well Plate 323 µL",
     "opentrons/nest_96_wellplate_2ml_deep":       "NEST 2 mL 96 Deep Well",
     "opentrons/nest_1_reservoir_290ml":           "NEST 290 mL Reservoir",
-    "custom_beta/nest_96_wellplate_1p6ml_deep_afl": "NEST 1.6 mL Deep Well (AFL)",
-    "custom_beta/nist_pneumatic_loader":       "NIST Pneumatic Loader (slot 10 only)",
-    "custom_beta/nist_6_20ml_vials":              "NIST 6 × 20 mL vial carrier",
-    "custom_beta/nist_2_100ml_bottles":           "NIST 2 × 100 mL bottle carrier",
+}
+
+# Modules shown after the labware options in the load dialog.
+FLEX_MODULE_OPTIONS = {
     "heaterShakerModuleV1":                       "Heater-Shaker (needs labware on top)",
     "magneticBlockV1":                            "Magnetic Block",
     "temperatureModuleV2":                        "Temperature Module GEN2",
@@ -39,20 +42,10 @@ FLEX_LABWARE_OPTIONS = {
 }
 
 
-# Cutout IDs that enable the staging column.
-# Includes the combined staging+waste-chute fixture variants.
-_STAGING_CUTOUT_IDS = {
-    "cutoutA4", "cutoutB4", "cutoutC4", "cutoutD4",
-    "stagingAreaRightSlot",
-    "stagingAreaRightSlotAndWasteChute",
-    "stagingAreaLeftSlot",
-}
-
-# Static mapping from right-column cutout IDs to Flex alphanumeric slot names.
-# Used to detect which slot holds a trash or waste-chute fixture.
-_TRASH_CUTOUTS = {
-    "cutoutA3": "A3", "cutoutB3": "B3", "cutoutC3": "C3", "cutoutD3": "D3",
-}
+# Cutout IDs that enable the staging column.  Staging fixtures are matched by
+# their "stagingArea" prefix, which also covers the combined staging +
+# waste-chute variants (e.g. stagingAreaSlotWithWasteChuteRightAdapterNoCover).
+_STAGING_CUTOUT_IDS = {"cutoutA4", "cutoutB4", "cutoutC4", "cutoutD4"}
 
 
 class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
@@ -62,21 +55,52 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
     (well rendering is robot-agnostic) and overrides :meth:`visualize_deck`.
     """
 
-    def _has_staging_area(self):
+    def _labware_choices(self):
+        """Return ``{key: label}`` options for the load-labware dialog.
+
+        Built-in Opentrons labware first, then every definition in the custom
+        labware directory (re-scanned on each call so newly added files show
+        up without a restart), then modules.  Custom entries are keyed by
+        ``namespace/loadName`` and labelled with the definition's
+        ``metadata.displayName``.
+        """
+        try:
+            self._load_custom_labware_defs()
+        except ValueError as e:
+            # Duplicate definitions: the first file for each key is still indexed.
+            self.log_warning(str(e))
+
+        custom = {}
+        for key, path in self.custom_labware_files.items():
+            try:
+                definition = json.loads(pathlib.Path(path).read_text())
+            except (OSError, ValueError) as e:
+                self.log_warning(f"Skipping unreadable labware definition {path}: {e}")
+                continue
+            custom[key] = definition.get("metadata", {}).get("displayName") or key
+
+        choices = dict(FLEX_LABWARE_OPTIONS)
+        for key in sorted(custom, key=lambda k: custom[k].lower()):
+            choices.setdefault(key, custom[key])
+        choices.update(FLEX_MODULE_OPTIONS)
+        return choices
+
+    def _has_staging_area(self, deck_config):
         """Return True if any deck-config entry enables the staging column."""
-        deck_config = self.config.get("deck_configuration", [])
         for entry in deck_config:
             cutout_id = entry.get("cutoutId", "")
             fixture_id = entry.get("cutoutFixtureId", "")
-            if cutout_id in _STAGING_CUTOUT_IDS or fixture_id in _STAGING_CUTOUT_IDS:
+            if cutout_id in _STAGING_CUTOUT_IDS or fixture_id.startswith("stagingArea"):
                 return True
         return False
 
 
-    def _get_flex_slot_info(self, slot_key, compact):
+    def _get_flex_slot_info(self, slot_key, compact, deck_config):
         """Build the slot info dict for *slot_key* (OT2 numeric string or staging label).
 
-        Returns the same structure expected by the Jinja template.
+        *deck_config* is the robot's ``cutoutFixtures`` list, used to mark
+        the trash slot.  Returns the same structure expected by the Jinja
+        template.
         """
         # slot_key is already a Flex alphanumeric (e.g. "D1") or staging ("A4").
         slot_str = str(slot_key).upper()
@@ -93,30 +117,20 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             "buttons": "",
         }
 
-        # Check for blocked (physically inaccessible) slots
-        blocked = [str(s).strip().upper() for s in self.config.get("blocked_slots", [])]
-        if slot_str in blocked:
-            info.update({
-                "name": "&#9747; No Access",
-                "type": "blocked",
-                "color": "#e0e0e0",
-            })
-            return info
-
-        # Check for trash fixture in this slot
-        deck_config = self.config.get("deck_configuration", [])
+        # Check for a trash bin or waste chute in this slot
         for entry in deck_config:
-            fixture = entry.get("cutoutFixtureId", "")
+            fixture = entry.get("cutoutFixtureId", "").lower()
             cutout = entry.get("cutoutId", "")
-            if "trash" in fixture.lower() or "wasteChute" in fixture.lower():
-                mapped_flex = _TRASH_CUTOUTS.get(cutout)
-                if mapped_flex == slot_str:
-                    info.update({
-                        "name": "Trash / Waste",
-                        "type": "trash",
-                        "color": "#ffcdd2",
-                    })
-                    return info
+            if cutout.removeprefix("cutout") != slot_str:
+                continue
+            if "wastechute" in fixture:
+                name = "Waste Chute" if "nocover" in fixture else "Waste Chute (covered)"
+            elif "trash" in fixture:
+                name = "Trash Bin"
+            else:
+                continue
+            info.update({"name": name, "type": "trash", "color": "#ffcdd2"})
+            return info
 
         has_labware = slot_str in self.config["loaded_labware"]
         has_module = slot_str in self.config["loaded_modules"]
@@ -217,18 +231,18 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
             ["C1", "C2", "C3"],  # Row C
             ["D1", "D2", "D3"],  # Row D (front)
         ]
+        deck_config = self._get_deck_configuration()
         staging_slots = []
-        has_staging = self._has_staging_area()
-        if has_staging:
+        if self._has_staging_area(deck_config):
             staging_slots = ["A4", "B4", "C4", "D4"]
 
         slot_infos = {}
         for row in base_layout:
             for slot in row:
-                slot_infos[slot] = self._get_flex_slot_info(slot, compact)
+                slot_infos[slot] = self._get_flex_slot_info(slot, compact, deck_config)
 
         for s in staging_slots:
-            slot_infos[s] = self._get_flex_slot_info(s, compact)
+            slot_infos[s] = self._get_flex_slot_info(s, compact, deck_config)
 
         # Gripper info
         gripper = self.config.get("loaded_gripper")
@@ -259,6 +273,10 @@ class FlexDeckWebAppMixin(OT2DeckWebAppMixin):
                 "labwareChoices": self._labware_choices(),
                 "gripperLoaded": gripper_info is not None,
                 "allSlots": all_slots,
+                # Offered as a move destination only when move_labware will accept it.
+                "wasteChuteAvailable": bool(
+                    getattr(self, "waste_chute", None) and not self.waste_chute["covered"]
+                ),
             }),
             inline_css=css,
             inline_js=js,

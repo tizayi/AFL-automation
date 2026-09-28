@@ -7,8 +7,8 @@ The Flex uses the same HTTP API base as the OT2 but with key differences:
 * Deck slots: alphanumeric ``A1–D3`` (and staging ``A4–D4``) instead of
   numeric ``1–12``.
 * Pipette names: ``flex_1channel_50``, ``flex_1channel_1000``, etc.
-* Deck configuration is a robot-level setting (not per-run) that must be
-  applied before any labware or modules are loaded.
+* Deck configuration is a robot-level setting (not per-run), set up in the
+  Opentrons App; this driver only reads it.
 * Trash is a configurable fixture (trash bin or waste chute), not a fixed
   location at slot 12.
 """
@@ -35,26 +35,20 @@ _OT2_TO_FLEX_SLOT = {
 # Staging-area slots are column-4 slots reachable only by the gripper.
 _STAGING_SLOTS = {"A4", "B4", "C4", "D4"}
 
-# Maps a staging slot to the cutout whose right-side fixture enables it.
-_STAGING_SLOT_TO_CUTOUT = {
-    "A4": "cutoutA3",
-    "B4": "cutoutB3",
-    "C4": "cutoutC3",
-    "D4": "cutoutD3",
+# The waste chute can only be installed in cutout D3.  Its fixture ID varies
+# (cover or no cover, combined with a staging area or a Flex Stacker), so it is
+# detected by substring rather than by exact ID.
+_WASTE_CHUTE_CUTOUT = "cutoutD3"
+
+# Waste-chute addressable area for tip drops, by number of active nozzles.
+_WASTE_CHUTE_TIP_AREAS = {
+    1: "1ChannelWasteChute",
+    8: "8ChannelWasteChute",
+    96: "96ChannelWasteChute",
 }
 
-# Modules that require a dedicated cutout fixture (same ID as the model name).
-# Temperature Module V2 uses no special fixture and is absent from this map.
-_MODULE_FIXTURE_IDS = {
-    "heaterShakerModuleV1": "heaterShakerModuleV1",
-    "magneticBlockV1":      "magneticBlockV1",
-    "thermocyclerModuleV2": "thermocyclerModuleV2",
-    "absorbanceReaderV1":   "absorbanceReaderV1",
-}
-
-# The Thermocycler on the Flex occupies two cutouts.  B1 is the user-facing
-# primary slot (OT2 slot 7); A1 is the additional cutout behind it (OT2 slot 10).
-_THERMOCYCLER_CUTOUTS = {"cutoutA1", "cutoutB1"}
+# Active nozzle count for each 96-channel nozzle layout (see configure_nozzle_layout).
+_NOZZLE_LAYOUT_CHANNELS = {"full96": 96, "column": 8, "single": 1}
 
 # Canonical config key used for the 96-channel pipette.  The Opentrons HTTP API
 # addresses it as "left" mount, but storing it under a distinct key prevents
@@ -73,23 +67,15 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     overrides : dict, optional
         Configuration overrides passed through to :class:`Driver`.
 
-    Configuration keys (in addition to those inherited from OT2HTTPDriver)
-    -----------------------------------------------------------------------
-    deck_configuration : list of dict
-        Opentrons deck-configuration payload.  Each entry is a dict with keys
-        ``cutoutId`` and ``cutoutFixtureId``.  Applied to the robot once at
-        startup via ``PUT /deck_configuration`` (robot-level, not per-run).
-
-        Default: all 12 cutouts populated — left/center columns as plain slots,
-        A3 as trash bin, B3/C3/D3 as ``stagingAreaRightSlot`` (enables the
-        staging column B4/C4/D4 by default).
-
-        Common fixture IDs:
-        - ``"trashBinAdapter"``       — trash bin
-        - ``"wasteChuteOnlyAdapter"`` — waste chute (no staging)
-        - ``"stagingAreaRightSlot"``  — staging area (provides both X3 and X4)
-        - ``"heaterShakerModuleV1"``  — heater-shaker (set automatically by load_module)
-        - ``"magneticBlockV1"``       — magnetic block (set automatically by load_module)
+    Deck configuration
+    ------------------
+    The deck configuration (trash bin, staging areas, module fixtures) is
+    owned by the robot and set up in the Opentrons App.  The driver never
+    writes it; it only reads ``GET /deck_configuration`` via
+    :meth:`_get_deck_configuration` to locate the trash bin and to render
+    the deck view.  Modules that need a fixture (heater-shaker, magnetic
+    block, thermocycler, absorbance reader) must already be configured on
+    the robot before :meth:`load_module` is called.
     """
 
     ROBOT_TYPE = "OT-3"
@@ -98,9 +84,21 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     # When dropping tips the Flex uses a movable trash bin, not the OT2's
     # fixed-position trash at slot 12.  The addressable area name depends on
     # which cutout the trash bin is placed in; cutoutA3 → movableTrashA3.
-    # Override ``TRASH_ADDRESSABLE_AREA`` or set ``trash_addressable_area`` in
-    # config if your deck uses a different cutout or a waste chute.
+    # It is detected from the robot's deck configuration at startup.
     TRASH_ADDRESSABLE_AREA = "movableTrashA3"
+
+    # Waste chute detected at startup: None, or {"fixture": <id>, "covered": bool}.
+    # Tips go to the chute only when no trash bin is configured.
+    waste_chute = None
+    use_waste_chute_for_tips = False
+    # False when the deck has neither a trash bin nor a waste chute; transfer()
+    # then refuses to start rather than failing at the tip drop.
+    tip_disposal_available = True
+
+    # Pipette currently holding a tip (set on pickUpTip, cleared on dropTipInPlace),
+    # and whether that tip must be discarded because the transfer using it failed.
+    tip_pipette_id = None
+    tip_contaminated = False
 
     PIPETTE_NAME_ALIASES = {
         # Full names pass through unchanged.
@@ -143,63 +141,41 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     # gather_defaults() walks the MRO and merges all class-level defaults dicts
     # automatically, so inherited keys do not need to be repeated here.
     defaults = {
-        "deck_configuration": [
-            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutA1"},
-            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutB1"},
-            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutC1"},
-            {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutD1"},
-            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutA2"},
-            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutB2"},
-            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutC2"},
-            {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutD2"},
-            {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
-            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutB3"},
-            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutC3"},
-            {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutD3"},
-        ],
         # None when no gripper detected, otherwise {"gripper_id": <serial>, "serial": <serial>}.
         "loaded_gripper": None,
-        # Slots that are physically inaccessible (e.g. holes in the deck).
-        # load_labware and move_labware will refuse to target these slots.
-        # Values should be Flex alphanumeric strings: ["A2", "B2", ...].
-        "blocked_slots": [],
     }
 
     def __init__(self, overrides=None):
-        # Set Flex API version header BEFORE OT2HTTPDriver.__init__ so that
-        # _initialize_robot() (called inside OT2HTTPDriver.__init__) uses
+        # _initialize_robot() (called inside OT2HTTPDriver.__init__) switches
+        # the headers to the Flex API version before its first request.
         OT2HTTPDriver.__init__(self, overrides=overrides)
         self.name = "FlexHTTPDriver"
-        # Override the API version header set by OT2HTTPDriver.__init__.
         self.headers = {"Opentrons-Version": self.API_VERSION}
 
-    def _check_slot_not_blocked(self, slot):
-        """Raise ValueError if *slot* is in the blocked_slots list."""
-        flex_slot = self._normalize_slot(slot)
-        blocked = [str(s).strip().upper() for s in self.config.get("blocked_slots", [])]
-        if flex_slot in blocked:
-            raise ValueError(
-                f"Slot {flex_slot!r} is physically inaccessible (listed in blocked_slots). "
-                "Remove the slot from blocked_slots in config if the obstruction is gone."
-            )
-
     def load_labware(self, name, slot, module=None, check_run_status=True, **kwargs):
-        """Refuse loads into blocked slots; otherwise delegate to OT2HTTPDriver."""
-        self._check_slot_not_blocked(slot)
+        """Normalize *slot* to its Flex name, then delegate to OT2HTTPDriver.
+
+        The parent compares *slot* directly against the (Flex-keyed)
+        ``loaded_labware`` and ``loaded_modules`` dicts.
+        """
+        slot = self._normalize_slot(slot)
         return super().load_labware(name, slot, module=module,
                                     check_run_status=check_run_status, **kwargs)
 
+    def load_module(self, name, slot, check_run_status=True, **kwargs):
+        """Normalize *slot* to its Flex name, then delegate to OT2HTTPDriver."""
+        return super().load_module(name, self._normalize_slot(slot),
+                                   check_run_status=check_run_status, **kwargs)
+
     def _initialize_robot(self):
-        """Initialize connection, then apply robot-level deck configuration."""
-        # Ensure the correct API version header is used for ALL startup calls,
-        # including _apply_deck_configuration().  OT2HTTPDriver.__init__ sets
-        # self.headers = {"Opentrons-Version": "2"} before calling this method
-        # via polymorphism, so we must override it here before any requests go out.
+        """Initialize connection, then detect the trash bin location."""
+        # Ensure the correct API version header is used for ALL startup calls.
+        # OT2HTTPDriver.__init__ sets self.headers = {"Opentrons-Version": "2"}
+        # before calling this method via polymorphism, so we must override it
+        # here before any requests go out.
         self.headers = {"Opentrons-Version": self.API_VERSION}
         super()._initialize_robot()
         self._home_if_needed()
-        self._update_modules()
-        self._sync_deck_configuration()
         self._autodetect_trash_area()
 
     def _home_if_needed(self):
@@ -235,67 +211,187 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             self.log_warning(f"Motor engagement check failed ({e}); homing to be safe.")
             self.home()
 
-    def _update_modules(self):
-        """Query ``GET /modules`` and cache each attached module's serial number.
+    def _get_deck_configuration(self):
+        """Return the robot's current deck configuration.
 
-        Builds ``self._module_serials``, a dict mapping cutout ID
-        (e.g. ``"cutoutD1"``) to serial number string.  This is used by
-        :meth:`_apply_deck_configuration` to inject
-        ``opentronsModuleSerialNumber`` into the deck-config payload so the
-        robot associates each fixture with the specific physical module unit
-        actually attached to that slot.
-
-        The Opentrons ``/modules`` response includes a ``physicalPort`` field
-        with a ``slot`` value that maps directly to the Flex slot name
-        (e.g. ``"D1"``).  We derive the cutout ID by prefixing ``"cutout"``.
+        Reads ``GET /deck_configuration`` and returns its ``cutoutFixtures``
+        list (dicts with ``cutoutId`` and ``cutoutFixtureId``).  Returns an
+        empty list if the robot cannot be reached, which callers treat as a
+        deck with no fixtures.
         """
-        self._module_serials = {}  # cutoutId -> serialNumber
         try:
             response = requests.get(
-                url=f"{self.base_url}/modules",
+                url=f"{self.base_url}/deck_configuration",
                 headers=self.headers,
                 timeout=5,
             )
             if response.status_code != 200:
                 self.log_warning(
-                    f"Could not fetch module list (HTTP {response.status_code}); "
-                    "serial numbers will be omitted from deck configuration."
+                    f"GET /deck_configuration returned HTTP {response.status_code}."
                 )
-                return
-
-            for module in response.json().get("data", []):
-                serial = module.get("serialNumber")
-                if not serial:
-                    continue
-                # physicalPort.slot is the Flex slot string, e.g. "D1"
-                slot = module.get("moduleOffset", {}).get("slot")
-                if slot:
-                    cutout_id = f"cutout{slot}"
-                    self._module_serials[cutout_id] = serial
-                    self.log_info(
-                        f"Module serial cached: {cutout_id} → {serial} "
-                        f"({module.get('moduleModel', module.get('moduleType', '?'))})"
-                    )
-            print(self._module_serials)
-        except Exception as e:  # noqa: BLE001 — best-effort, don't block startup
-            self.log_warning(f"_update_modules: {e}; serial numbers will be omitted.")
+                return []
+            return response.json().get("data", {}).get("cutoutFixtures", [])
+        except Exception as e:  # noqa: BLE001 — best-effort, callers fall back
+            self.log_warning(f"Could not read robot deck configuration ({e}).")
+            return []
 
     def _autodetect_trash_area(self):
-        """Set TRASH_ADDRESSABLE_AREA from the deck configuration.
+        """Detect the trash bin and waste chute from the robot's deck configuration.
 
-        Scans ``deck_configuration`` for a ``trashBinAdapter`` entry and
-        derives the matching addressable area name (e.g. ``cutoutD3`` →
-        ``movableTrashD3``).  Falls back to ``"movableTrashA3"`` if none found.
+        Sets ``TRASH_ADDRESSABLE_AREA`` from a ``trashBinAdapter`` entry
+        (e.g. ``cutoutD3`` → ``movableTrashD3``) and :attr:`waste_chute` from
+        any cutout-D3 fixture whose ID contains ``WasteChute``.  Tips are
+        dropped in the trash bin when one exists, otherwise in the waste chute.
+        If neither exists (or the deck configuration cannot be read),
+        :attr:`tip_disposal_available` is set to ``False``.
         """
-        for entry in self.config.get("deck_configuration", []):
-            if entry.get("cutoutFixtureId") == "trashBinAdapter":
-                cutout = entry.get("cutoutId", "")
-                area = self._TRASH_CUTOUT_TO_AREA.get(cutout)
-                if area:
-                    self.TRASH_ADDRESSABLE_AREA = area
-                    self.log_info(f"Trash area set to {area!r} (from {cutout!r})")
-                    return
-        self.TRASH_ADDRESSABLE_AREA = "movableTrashA3"
+        trash_area = None
+        self.waste_chute = None
+        for entry in self._get_deck_configuration():
+            fixture = entry.get("cutoutFixtureId", "")
+            cutout = entry.get("cutoutId", "")
+            if fixture == "trashBinAdapter" and trash_area is None:
+                trash_area = self._TRASH_CUTOUT_TO_AREA.get(cutout)
+            elif cutout == _WASTE_CHUTE_CUTOUT and "wastechute" in fixture.lower():
+                self.waste_chute = {
+                    "fixture": fixture,
+                    "covered": "nocover" not in fixture.lower(),
+                }
+
+        self.TRASH_ADDRESSABLE_AREA = trash_area or "movableTrashA3"
+        self.use_waste_chute_for_tips = trash_area is None and self.waste_chute is not None
+        self.tip_disposal_available = trash_area is not None or self.waste_chute is not None
+
+        if not self.tip_disposal_available:
+            self.log_error(
+                "No trash bin or waste chute found in the robot's deck configuration; "
+                "transfers are disabled until one is configured in the Opentrons App."
+            )
+            return
+        if self.waste_chute:
+            self.log_info(f"Waste chute detected ({self.waste_chute['fixture']!r})")
+        if self.use_waste_chute_for_tips:
+            self.log_info("No trash bin configured; dropping tips in the waste chute")
+        else:
+            self.log_info(f"Trash area set to {self.TRASH_ADDRESSABLE_AREA!r}")
+
+    def _require_tip_disposal(self):
+        """Raise unless there is somewhere to drop tips.
+
+        Re-reads the deck configuration first, so a trash bin or chute added in
+        the Opentrons App after startup is picked up without a restart.
+        """
+        if self.tip_disposal_available:
+            return
+        self._autodetect_trash_area()
+        if not self.tip_disposal_available:
+            raise RuntimeError(
+                "No trash bin or waste chute in the robot's deck configuration, so "
+                "used tips could not be dropped. Configure one in the Opentrons App "
+                "before transferring."
+            )
+
+    def transfer(self, source, dest, volume, *args, **kwargs):
+        """Check that tips can be dropped, then delegate to OT2HTTPDriver.transfer.
+
+        The check runs before any tip is picked up or liquid moved, so a missing
+        trash bin or chute cannot leave a used tip on the pipette.  A tip left
+        on the pipette by a failed transfer is discarded first, never reused.
+        """
+        self._require_tip_disposal()
+        self._discard_contaminated_tip()
+        try:
+            return super().transfer(source, dest, volume, *args, **kwargs)
+        except Exception:
+            self._mark_tip_contaminated()
+            raise
+
+    def mix(self, volume, location, repetitions=1, **kwargs):
+        """Discard a tip left by a failed transfer, then delegate to OT2HTTPDriver.mix."""
+        self._discard_contaminated_tip()
+        try:
+            return super().mix(volume, location, repetitions=repetitions, **kwargs)
+        except Exception:
+            self._mark_tip_contaminated()
+            raise
+
+    def _execute_atomic_command(self, command_type, params=None, *args, **kwargs):
+        """Run a command via OT2HTTPDriver, tracking which pipette holds a tip."""
+        pipette_id = (params or {}).get("pipetteId")
+        result = super()._execute_atomic_command(command_type, params, *args, **kwargs)
+        self._track_tip(command_type, pipette_id)
+        return result
+
+    def _track_tip(self, command_type, pipette_id):
+        if command_type == "pickUpTip":
+            self.tip_pipette_id = pipette_id
+        elif command_type == "dropTipInPlace":
+            self.tip_pipette_id = None
+            self.tip_contaminated = False
+
+    def _mark_tip_contaminated(self):
+        if self.has_tip:
+            self.tip_contaminated = True
+            self.log_warning(
+                "Transfer failed with a tip attached; it will be discarded before "
+                "the next transfer instead of being reused."
+            )
+
+    def _discard_contaminated_tip(self):
+        """Drop a tip left on the pipette by a failed transfer or mix."""
+        if not (self.tip_contaminated and self.has_tip):
+            self.tip_contaminated = False
+            return
+        pipette_id = self.tip_pipette_id
+        if pipette_id is None:
+            mount = self.last_pipette
+            pipette_id = self.pipette_info.get(mount, {}).get("id") if mount else None
+        if pipette_id is None:
+            raise RuntimeError(
+                "A used tip from a failed transfer is still attached, but the pipette "
+                "holding it is unknown. Remove it manually, then call reset_deck()."
+            )
+        self.log_info(f"Discarding tip left on pipette {pipette_id} by a failed transfer")
+        self._execute_atomic_command(
+            "moveToAddressableAreaForDropTip",
+            {
+                "pipetteId": pipette_id,
+                "addressableAreaName": self._tip_drop_area(pipette_id),
+                "offset": {"x": 0, "y": 0, "z": 10},
+                "alternateDropLocation": False,
+            },
+            check_run_status=False,
+        )
+        self._execute_atomic_command("dropTipInPlace", {"pipetteId": pipette_id}, check_run_status=False)
+        self.has_tip = False
+
+    def _active_channels(self, pipette_id):
+        """Return the number of active nozzles on the pipette with *pipette_id*."""
+        for mount, info in self.pipette_info.items():
+            if info and info.get("id") == pipette_id:
+                if mount == _96CH_MOUNT_KEY or "96channel" in str(info.get("name", "")):
+                    layout = (
+                        self.config.get("loaded_instruments", {})
+                        .get(_96CH_MOUNT_KEY, {})
+                        .get("nozzle_layout", "full96")
+                    )
+                    return _NOZZLE_LAYOUT_CHANNELS.get(layout, 96)
+                return int(info.get("channels") or 1)
+        return 1
+
+    def _tip_drop_area(self, pipette_id):
+        """Return the trash bin area, or the waste-chute area for this pipette."""
+        if not self.use_waste_chute_for_tips:
+            return self.TRASH_ADDRESSABLE_AREA
+
+        channels = self._active_channels(pipette_id)
+        if channels == 96 and self.waste_chute["covered"]:
+            raise RuntimeError(
+                "The 96-channel pipette cannot drop all 96 tips into a covered "
+                "waste chute. Remove the chute cover and update the deck "
+                "configuration in the Opentrons App."
+            )
+        return _WASTE_CHUTE_TIP_AREAS.get(channels, "1ChannelWasteChute")
 
     # ------------------------------------------------------------------
     # Slot translation
@@ -313,7 +409,8 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
 
         Staging slots ``"A4"``–``"D4"`` are Flex-native and pass through
         unchanged.  They are only reachable by the gripper; pipettes cannot
-        access them.  They are enabled by default in the deck configuration.
+        access them, and they only exist if the robot's deck configuration
+        has a staging-area fixture.
 
         Parameters
         ----------
@@ -363,146 +460,6 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         if flex_slot in _STAGING_SLOTS:
             return {"addressableAreaName": flex_slot}
         return {"slotName": flex_slot}
-
-    # ------------------------------------------------------------------
-    # Deck configuration
-    # ------------------------------------------------------------------
-
-
-    def _sync_deck_configuration(self):
-        """Read the robot's current deck configuration, store it, then push it back.
-
-        Uses ``GET /deck_configuration`` to fetch whatever the robot currently
-        has (e.g. set via the Opentrons App) and adopts it as the working
-        configuration.  Falls back to the AFL defaults already in
-        ``self.config["deck_configuration"]`` if the GET fails or returns an
-        empty fixture list.
-
-        After syncing the in-memory config, ``_apply_deck_configuration`` is
-        called unconditionally so that module serial numbers are always injected
-        before the first run is created.
-        """
-        try:
-            response = requests.get(
-                url=f"{self.base_url}/deck_configuration",
-                headers=self.headers,
-                timeout=5,
-            )
-            if response.status_code == 200:
-                robot_fixtures = (
-                    response.json().get("data", {}).get("cutoutFixtures", [])
-                )
-                if robot_fixtures:
-                    # Strip opentronsModuleSerialNumber — we re-inject live
-                    # serials from _module_serials inside _apply_deck_configuration.
-                    # cleaned = [
-                    #     {k: v for k, v in e.items() if k != "opentronsModuleSerialNumber"}
-                    #     for e in robot_fixtures
-                    # ]
-                    self.config["deck_configuration"] = robot_fixtures
-                    self.config._update_history()
-                    self.log_info(
-                        f"Adopted deck configuration from robot ({len(robot_fixtures)} fixtures)."
-                    )
-                else:
-                    self.log_info(
-                        "Robot returned an empty deck configuration; using AFL defaults."
-                    )
-            else:
-                self.log_warning(
-                    f"GET /deck_configuration returned HTTP {response.status_code}; "
-                    "using AFL defaults."
-                )
-        except Exception as e:  # noqa: BLE001
-            self.log_warning(
-                f"Could not read robot deck configuration ({e}); using AFL defaults."
-            )
-
-        self._apply_deck_configuration()
-
-    def _apply_deck_configuration(self):
-        """Set the robot-level deck configuration via ``PUT /deck_configuration``.
-
-        In Opentrons API v4+, deck configuration is a robot-level setting, not
-        scoped to a run.  Call this once after connecting (or whenever the
-        physical deck layout changes) before creating a run.
-
-        The payload format is a list of cutout fixture assignments::
-
-            [{"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"}, ...]
-        """
-        deck_config = self.config.get("deck_configuration", [])
-        if not deck_config:
-            self.log_info("No deck configuration defined; skipping.")
-            return
-
-        # Inject module serial numbers discovered at startup.  The robot uses
-        # opentronsModuleSerialNumber to match the fixture to a specific physical
-        # unit, which is required when multiple modules of the same type could
-        # theoretically be present.  We never persist serials to config — they
-        # are always fetched live from GET /modules.
-        module_serials = getattr(self, "_module_serials", {})
-        enriched_config = []
-        _module_fixture_ids = set(_MODULE_FIXTURE_IDS.values()) | {"thermocyclerModuleV2"}
-        for entry in deck_config:
-            if entry.get("cutoutFixtureId") in _module_fixture_ids:
-                serial = module_serials.get(entry["cutoutId"])
-                if serial:
-                    enriched_entry = dict(entry)
-                    enriched_entry["opentronsModuleSerialNumber"] = serial
-                    enriched_config.append(enriched_entry)
-                    continue
-            enriched_config.append(entry)
-
-        self.log_info(f"Applying deck configuration: {enriched_config}")
-
-        response = requests.put(
-            url=f"{self.base_url}/deck_configuration",
-            headers=self.headers,
-            json={"data": {"cutoutFixtures": enriched_config}},
-        )
-
-        if response.status_code not in (200, 201):
-            raise RuntimeError(
-                f"Failed to apply Flex deck configuration "
-                f"(HTTP {response.status_code}): {response.text}"
-            )
-
-        self.log_info("Flex deck configuration applied successfully.")
-
-    @Driver.unqueued()
-    def set_staging_areas(self, cutouts):
-        """Enable staging-area slots on the specified right-column cutouts.
-
-        Staging areas are enabled by default (B3/C3/D3 use ``stagingAreaRightSlot``
-        in the default deck configuration).  Call this only if a cutout was
-        previously set to ``singleRightSlot`` and needs to be restored.
-
-        Replaces ``singleRightSlot`` entries in ``deck_configuration`` with
-        ``stagingAreaRightSlot`` for the given cutouts, then immediately
-        re-applies the deck configuration to the robot.
-
-        Staging slots (A4–D4) are only reachable by the gripper.  The
-        corresponding regular slot (e.g. B3 when enabling B4) remains
-        accessible — ``stagingAreaRightSlot`` provides *both* areas.
-
-        Parameters
-        ----------
-        cutouts : list of str
-            One or more cutout IDs to enable staging on, e.g.
-            ``["cutoutB3", "cutoutC3"]``.
-        """
-        cutout_set = set(cutouts)
-        new_config = []
-        for entry in self.config.get("deck_configuration", []):
-            if entry["cutoutId"] in cutout_set and entry["cutoutFixtureId"] == "singleRightSlot":
-                new_config.append({"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": entry["cutoutId"]})
-            else:
-                new_config.append(entry)
-        self.config["deck_configuration"] = new_config
-        self.config._update_history()
-        self._apply_deck_configuration()
-        self.log_info(f"Staging areas enabled for: {sorted(cutout_set)}")
 
     # ------------------------------------------------------------------
     # Gripper
@@ -570,7 +527,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             "button_text": "Move Labware",
             "params": {
                 "source_slot": {"label": "Source Slot", "type": "text", "default": "1"},
-                "dest_slot": {"label": "Dest Slot (or offDeck)", "type": "text", "default": "2"},
+                "dest_slot": {"label": "Dest Slot (or offDeck / wasteChute)", "type": "text", "default": "2"},
                 "use_gripper": {"label": "Use Gripper", "type": "bool", "default": True},
             },
         }
@@ -586,9 +543,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ----------
         source_slot : str or int
             OT2-convention slot (``"1"``–``"12"'') containing the labware to move.
-        dest_slot : str or int or ``"offDeck"``
-            Destination slot, or ``"offDeck"`` to remove the labware from the
-            deck entirely.
+        dest_slot : str or int or ``"offDeck"`` or ``"wasteChute"``
+            Destination slot, ``"offDeck"`` to remove the labware from the
+            deck entirely, or ``"wasteChute"`` to discard it down an uncovered
+            waste chute with the gripper.
         use_gripper : bool
             If ``True`` (default), use the gripper.  The gripper must already
             be loaded via :meth:`load_gripper`.
@@ -603,34 +561,14 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ValueError
             If *source_slot* contains no loaded labware.
         RuntimeError
-            If *use_gripper* is ``True`` but the gripper has not been loaded.
+            If *use_gripper* is ``True`` but the gripper has not been loaded,
+            or *dest_slot* is ``"wasteChute"`` without the gripper or without
+            an uncovered waste chute.
         """
-        source_slot = self._normalize_slot(source_slot)
-
-        if source_slot not in self.config["loaded_labware"]:
-            raise ValueError(
-                f"No labware loaded in slot {source_slot!r}. "
-                f"Loaded slots: {list(self.config['loaded_labware'].keys())}"
-            )
-
-        dest_str_check = str(dest_slot).strip().lower()
-        if dest_str_check != "offdeck":
-            self._check_slot_not_blocked(dest_slot)
-
+        source_slot, new_location, dest_label, strategy = self._plan_labware_move(
+            source_slot, dest_slot, use_gripper
+        )
         labware_id, labware_name, labware_data = self.config["loaded_labware"][source_slot]
-
-        if use_gripper and not self.config.get("loaded_gripper"):
-            raise RuntimeError(
-                "Gripper is not loaded. Call load_gripper() before move_labware()."
-            )
-
-        strategy = "usingGripper" if use_gripper else "manualMoveWithoutPause"
-
-        dest_str = str(dest_slot).strip().lower()
-        if dest_str == "offdeck":
-            new_location = "offDeck"
-        else:
-            new_location = self._slot_location(dest_slot)
 
         run_id = self._ensure_run_exists()
 
@@ -651,25 +589,95 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             },
         )
         self._check_cmd_success(move_response)
+        return self._record_labware_move(source_slot, dest_label, strategy)
 
-        # Update labware tracking to reflect the new position.
-        del self.config["loaded_labware"][source_slot]
-        if dest_str != "offdeck":
-            self.config["loaded_labware"][self._normalize_slot(dest_slot)] = (
-                labware_id, labware_name, labware_data
+    def _plan_labware_move(self, source_slot, dest_slot, use_gripper):
+        """Validate a move and return ``(source_slot, new_location, dest_label, strategy)``.
+
+        *new_location* is the ``moveLabware`` payload value; *dest_label* is
+        the Flex slot name, ``"offDeck"`` or ``"wasteChute"``.
+        """
+        source_slot = self._normalize_slot(source_slot)
+        if source_slot not in self.config["loaded_labware"]:
+            raise ValueError(
+                f"No labware loaded in slot {source_slot!r}. "
+                f"Loaded slots: {list(self.config['loaded_labware'].keys())}"
             )
+
+        if use_gripper and not self.config.get("loaded_gripper"):
+            raise RuntimeError(
+                "Gripper is not loaded. Call load_gripper() before move_labware()."
+            )
+        strategy = "usingGripper" if use_gripper else "manualMoveWithoutPause"
+
+        dest_str = str(dest_slot).strip().lower()
+        if dest_str == "wastechute":
+            if not use_gripper:
+                raise RuntimeError("Discarding labware in the waste chute requires the gripper.")
+            if not self.waste_chute or self.waste_chute["covered"]:
+                raise RuntimeError(
+                    "No uncovered waste chute in the robot's deck configuration; "
+                    "cannot discard labware with the gripper."
+                )
+            return source_slot, {"addressableAreaName": "gripperWasteChute"}, "wasteChute", strategy
+        if dest_str == "offdeck":
+            return source_slot, "offDeck", "offDeck", strategy
+        return source_slot, self._slot_location(dest_slot), self._normalize_slot(dest_slot), strategy
+
+    def _record_labware_move(self, source_slot, dest_label, strategy):
+        """Update labware and tip tracking after a successful move."""
+        labware_id, labware_name, labware_data = self.config["loaded_labware"].pop(source_slot)
+        if dest_label in ("offDeck", "wasteChute"):
+            self._forget_tiprack(labware_id)
+        else:
+            self.config["loaded_labware"][dest_label] = (labware_id, labware_name, labware_data)
         self.config._update_history()
 
         self.log_info(
-            f"Moved '{labware_name}' from slot {source_slot} to {self._normalize_slot(dest_slot)} "
+            f"Moved '{labware_name}' from slot {source_slot} to {dest_label} "
             f"(strategy: {strategy!r})"
         )
         return {
             "source_slot": source_slot,
-            "dest_slot": self._normalize_slot(dest_slot),
+            "dest_slot": dest_label,
             "strategy": strategy,
             "labware_id": labware_id,
         }
+
+    def _forget_tiprack(self, labware_id):
+        """Stop drawing tips from *labware_id* once it has left the deck."""
+        for mount, tips in self.config.get("available_tips", {}).items():
+            remaining = [(rack, well) for rack, well in tips if rack != labware_id]
+            if len(remaining) != len(tips):
+                self.config["available_tips"][mount] = remaining
+                self.log_info(
+                    f"Removed {len(tips) - len(remaining)} tips from {mount} mount: "
+                    f"tip rack {labware_id} left the deck"
+                )
+        for instrument in self.config.get("loaded_instruments", {}).values():
+            racks = instrument.get("tip_racks", [])
+            if labware_id in racks:
+                instrument["tip_racks"] = [r for r in racks if r != labware_id]
+
+    def _align_script_header(self):
+        """Alignment-script header declaring a Flex protocol.
+
+        Flex protocols must declare ``robotType: "Flex"`` in ``requirements``
+        (apiLevel 2.15+); otherwise the Opentrons App analyses them as OT-2
+        protocols and rejects Flex slot names such as ``"D1"``.
+        """
+        return [
+            "from opentrons import protocol_api",
+            "",
+            "metadata = {",
+            "    'protocolName': 'Alignment Check',",
+            "    'author': 'AFL Auto-Generated',",
+            "    'description': 'Script for aligning and testing deck configuration',",
+            "}",
+            "",
+            "requirements = {'robotType': 'Flex', 'apiLevel': '2.16'}",
+            "",
+        ]
 
     # ------------------------------------------------------------------
     # 96-channel pipette support
@@ -694,26 +702,16 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
                 self.pipette_info[_96CH_MOUNT_KEY]["id"] = stored_id
 
     def reset_deck(self):
-        """Reset deck state, revert module fixtures, and clear gripper."""
+        """Reset deck state, clear the gripper, and forget any attached tip.
+
+        The run is discarded, so the robot starts the next one with no tip;
+        remove any physical tip by hand before calling this.
+        """
         super().reset_deck()
         self.config["loaded_gripper"] = None
-
-        # Revert any module-specific cutout fixtures back to the default plain-slot
-        # fixture for their column.  load_module will re-declare the correct fixture
-        # when the module is reloaded on the next run.
-        _module_fixtures = set(_MODULE_FIXTURE_IDS.values())
-        _col_default = {"1": "singleLeftSlot", "2": "singleCenterSlot", "3": "stagingAreaRightSlot"}
-        new_deck_config = []
-        for entry in self.config.get("deck_configuration", []):
-            if entry["cutoutFixtureId"] in _module_fixtures:
-                col = entry["cutoutId"][-1]
-                new_deck_config.append({
-                    "cutoutId": entry["cutoutId"],
-                    "cutoutFixtureId": _col_default.get(col, "singleLeftSlot"),
-                })
-            else:
-                new_deck_config.append(entry)
-        self.config["deck_configuration"] = new_deck_config
+        self.has_tip = False
+        self.tip_pipette_id = None
+        self.tip_contaminated = False
         self.config._update_history()
 
     def load_instrument(self, name, mount, tip_rack_slots, reload=False, **kwargs):
@@ -772,75 +770,6 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         ]
         self.config._update_history()
         return (first_rack_id, "A1")
-
-    def load_module(self, name, slot, check_run_status=True, **kwargs):
-        """Load a module, updating the deck configuration first if required.
-
-        Modules like the heater-shaker and magnetic block need their cutout
-        declared as a specific fixture before the Flex API will accept a
-        ``loadModule`` command.  This override swaps the plain slot fixture for
-        the module fixture, re-applies the deck configuration, then delegates
-        to the parent implementation.
-
-        If ``_update_modules()`` has been called at startup and the requested
-        slot does not contain a physically attached module, a clear
-        ``ValueError`` is raised before any HTTP call is made.
-        """
-        flex_slot = self._normalize_slot(slot)
-        cutout_id = f"cutout{flex_slot}"
-
-        # Cross-check against the live module list gathered at startup.
-        # _module_serials maps cutoutId → serial for every physically attached
-        # module.  If we have that data and the slot isn't in it, the user has
-        # nominated the wrong slot — tell them now rather than letting the robot
-        # return an opaque ModuleNotAttachedError.
-        module_serials = getattr(self, "_module_serials", {})
-        if module_serials:  # only validate when we have live data
-            fixture_id = _MODULE_FIXTURE_IDS.get(name)
-            if fixture_id and cutout_id not in module_serials:
-                attached = {
-                    cid: self._normalize_slot(cid.removeprefix("cutout"))
-                    for cid in module_serials
-                }
-                raise ValueError(
-                    f"No {name!r} detected at slot {flex_slot!r} (cutout {cutout_id!r}). "
-                    f"Physically attached modules are at slots: "
-                    f"{sorted(attached.values())}. "
-                    "Check the slot argument or verify the module is connected."
-                )
-
-        if name == "thermocyclerModuleV2":
-            # Thermocycler always occupies cutoutA1 (behind) and cutoutB1 (primary),
-            # regardless of which slot the caller nominates.  Handle it separately so
-            # the general single-cutout logic cannot write a stale third entry.
-            new_config = [
-                e for e in self.config.get("deck_configuration", [])
-                if e["cutoutId"] not in _THERMOCYCLER_CUTOUTS
-            ]
-            for c in sorted(_THERMOCYCLER_CUTOUTS):
-                new_config.append({"cutoutId": c, "cutoutFixtureId": "thermocyclerModuleV2"})
-            self.config["deck_configuration"] = new_config
-            self.config._update_history()
-            self._apply_deck_configuration()
-        else:
-            fixture_id = _MODULE_FIXTURE_IDS.get(name)
-            if fixture_id:
-                # Replace the existing fixture entry for this cutout (or append if absent).
-                new_config = []
-                replaced = False
-                for entry in self.config.get("deck_configuration", []):
-                    if entry["cutoutId"] == cutout_id:
-                        new_config.append({"cutoutId": cutout_id, "cutoutFixtureId": fixture_id})
-                        replaced = True
-                    else:
-                        new_config.append(entry)
-                if not replaced:
-                    new_config.append({"cutoutId": cutout_id, "cutoutFixtureId": fixture_id})
-                self.config["deck_configuration"] = new_config
-                self.config._update_history()
-                self._apply_deck_configuration()
-
-        return super().load_module(name, slot, check_run_status=check_run_status, **kwargs)
 
     @Driver.queued()
     def configure_nozzle_layout(self, config_type="full96", **kwargs):

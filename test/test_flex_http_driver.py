@@ -6,12 +6,14 @@ The test strategy mirrors test_ot2_http_driver.py:
 - Tests are grouped by concern:
   1. Slot translation (_normalize_slot / _api_slot_name)
   2. Class-level attribute overrides (API version, trash area, pipette aliases)
-  3. Deck configuration (_after_run_created / _apply_deck_configuration)
+  3. Deck configuration (read-only: _get_deck_configuration / trash detection)
   4. Transfer command uses the correct trash addressable area
   5. FlexPrepare MRO sanity
   6. Gripper support
   7. VirtualFlexHTTPDriver
 """
+
+import json
 
 import pytest
 from pathlib import Path
@@ -20,7 +22,10 @@ from unittest.mock import patch, call
 from AFL.automation.prepare.FlexHTTPDriver import FlexHTTPDriver, _OT2_TO_FLEX_SLOT, _96CH_MOUNT_KEY
 from AFL.automation.prepare.FlexPrepare import FlexPrepare
 from AFL.automation.prepare.OT2HTTPDriver import OT2HTTPDriver
-from AFL.automation.prepare.VirtualFlexHTTPDriver import VirtualFlexHTTPDriver
+from AFL.automation.prepare.VirtualFlexHTTPDriver import (
+    VirtualFlexHTTPDriver,
+    VIRTUAL_DECK_CONFIGURATION,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,9 +52,6 @@ class StubFlexHTTPDriver(FlexHTTPDriver):
             "loaded_labware": {},
             "available_tips": {},
             "loaded_modules": {},
-            "deck_configuration": [
-                {"cutoutId": "cutoutA3", "cutoutFixtureId": "trashBinAdapter"},
-            ],
             "loaded_gripper": None,
         })
         self.data = {}
@@ -66,13 +68,12 @@ class StubFlexHTTPDriver(FlexHTTPDriver):
         self.pipette_info = {}
         self.hardware_pipettes = {}
         self.executed_commands = []
+        self.fail_on = None  # command type to fail once, for error-path tests
         self.custom_labware_files = {}
         self.sent_custom_labware = {}
         self.custom_labware_dir = Path("/tmp/flex-http-driver-tests")
-        self.headers = {"Opentrons-Version": "3"}
+        self.headers = {"Opentrons-Version": FlexHTTPDriver.API_VERSION}
         self.base_url = "http://flex.test"
-        # Track deck-config calls
-        self.deck_config_calls = []
 
     def _ensure_run_exists(self, check_run_status=True):
         return self.run_id
@@ -95,6 +96,9 @@ class StubFlexHTTPDriver(FlexHTTPDriver):
         return [{"labwareId": "labware_1", "wellName": location[-2:]}]
 
     def _execute_atomic_command(self, command, params, check_run_status=True):
+        if command == self.fail_on:
+            self.fail_on = None
+            raise RuntimeError(f"simulated {command} failure")
         if command == "pickUpTip":
             mount = params["pipetteMount"]
             self.get_tip(mount)
@@ -103,11 +107,9 @@ class StubFlexHTTPDriver(FlexHTTPDriver):
         elif command == "dropTipInPlace":
             self.has_tip = False
 
+        self._track_tip(command, params.get("pipetteId"))
         self.executed_commands.append((command, dict(params)))
         return {"commandType": command, "params": params}
-
-    def _apply_deck_configuration(self, run_id):
-        self.deck_config_calls.append(run_id)
 
 
 def _flex_pipette_info(mount, pipette_id, *, min_volume, max_volume, channels=1):
@@ -193,12 +195,8 @@ class TestSlotTranslation:
 # ---------------------------------------------------------------------------
 
 class TestClassAttributes:
-    def test_api_version_is_3(self):
-        assert FlexHTTPDriver.API_VERSION == "3"
-
-    def test_headers_use_version_3(self):
-        driver = StubFlexHTTPDriver()
-        assert driver.headers == {"Opentrons-Version": "3"}
+    def test_api_version_is_4(self):
+        assert FlexHTTPDriver.API_VERSION == "4"
 
     def test_trash_addressable_area_is_movable_trash(self):
         assert FlexHTTPDriver.TRASH_ADDRESSABLE_AREA == "movableTrashA3"
@@ -238,57 +236,159 @@ class TestClassAttributes:
 # 3. Deck configuration
 # ---------------------------------------------------------------------------
 
+class _DeckConfigResponse:
+    def __init__(self, status_code=200, payload=None, text="ok"):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
 class TestDeckConfiguration:
-    def test_after_run_created_calls_apply_deck_configuration(self):
+    def test_get_deck_configuration_reads_robot_endpoint(self):
         driver = StubFlexHTTPDriver()
-        driver._after_run_created("run-001")
-        assert driver.deck_config_calls == ["run-001"]
+        robot_fixtures = [
+            {"cutoutId": "cutoutD3", "cutoutFixtureId": "trashBinAdapter"},
+        ]
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get:
+            mock_get.return_value = _DeckConfigResponse(
+                payload={"data": {"cutoutFixtures": robot_fixtures}}
+            )
+            result = driver._get_deck_configuration()
 
-    def test_apply_deck_configuration_posts_to_correct_endpoint(self):
+        assert result == robot_fixtures
+        assert mock_get.call_args.kwargs["url"] == "http://flex.test/deck_configuration"
+
+    def test_get_deck_configuration_returns_empty_on_http_error(self):
         driver = StubFlexHTTPDriver()
-        # Un-stub _apply_deck_configuration to test the real one
-        posted = []
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get:
+            mock_get.return_value = _DeckConfigResponse(500, text="boom")
+            assert driver._get_deck_configuration() == []
 
-        class _FakeResponse:
-            status_code = 200
-            text = "ok"
-            def json(self): return {}
-
-        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.patch") as mock_patch:
-            mock_patch.return_value = _FakeResponse()
-            FlexHTTPDriver._apply_deck_configuration(driver, "run-xyz")
-
-        mock_patch.assert_called_once()
-        args, kwargs = mock_patch.call_args
-        assert "run-xyz/deckConfiguration" in kwargs["url"]
-        assert kwargs["json"]["data"] == driver.config["deck_configuration"]
-
-    def test_apply_deck_configuration_raises_on_http_error(self):
+    def test_get_deck_configuration_returns_empty_on_request_error(self):
         driver = StubFlexHTTPDriver()
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get:
+            mock_get.side_effect = ConnectionError("down")
+            assert driver._get_deck_configuration() == []
 
-        class _ErrorResponse:
-            status_code = 422
-            text = "Unprocessable Entity"
+    def test_driver_never_writes_deck_configuration(self):
+        assert not hasattr(FlexHTTPDriver, "_apply_deck_configuration")
+        assert not hasattr(FlexHTTPDriver, "set_staging_areas")
+        assert "deck_configuration" not in FlexHTTPDriver.gather_defaults()
 
-        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.patch") as mock_patch:
-            mock_patch.return_value = _ErrorResponse()
-            with pytest.raises(RuntimeError, match="Failed to apply Flex deck configuration"):
-                FlexHTTPDriver._apply_deck_configuration(driver, "run-bad")
-
-    def test_apply_deck_configuration_skips_when_empty(self):
+    def test_trash_area_detected_from_robot_configuration(self):
         driver = StubFlexHTTPDriver()
-        driver.config["deck_configuration"] = []
+        with patch.object(
+            driver,
+            "_get_deck_configuration",
+            return_value=[{"cutoutId": "cutoutD3", "cutoutFixtureId": "trashBinAdapter"}],
+        ):
+            driver._autodetect_trash_area()
+        assert driver.TRASH_ADDRESSABLE_AREA == "movableTrashD3"
 
-        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.patch") as mock_patch:
-            FlexHTTPDriver._apply_deck_configuration(driver, "run-empty")
-        mock_patch.assert_not_called()
-
-    def test_default_deck_configuration_has_trash_bin(self):
+    def test_trash_area_falls_back_when_robot_unreachable(self):
         driver = StubFlexHTTPDriver()
-        deck_config = driver.config["deck_configuration"]
-        assert len(deck_config) >= 1
-        cutout_ids = [entry["cutoutId"] for entry in deck_config]
-        assert "cutoutA3" in cutout_ids
+        with patch.object(driver, "_get_deck_configuration", return_value=[]):
+            driver._autodetect_trash_area()
+        assert driver.TRASH_ADDRESSABLE_AREA == "movableTrashA3"
+
+
+class TestNumericSlotNormalization:
+    def test_load_labware_passes_flex_slot_to_parent(self):
+        driver = StubFlexHTTPDriver()
+        with patch.object(OT2HTTPDriver, "load_labware", return_value="lw") as parent:
+            driver.load_labware("corning_96_wellplate_360ul_flat", "3")
+        assert parent.call_args.args[1] == "D3"
+
+    def test_load_labware_accepts_int_and_lowercase_slots(self):
+        driver = StubFlexHTTPDriver()
+        with patch.object(OT2HTTPDriver, "load_labware", return_value="lw") as parent:
+            driver.load_labware("plate", 3)
+            driver.load_labware("plate", "d3")
+        assert [c.args[1] for c in parent.call_args_list] == ["D3", "D3"]
+
+    def test_load_module_passes_flex_slot_to_parent(self):
+        driver = StubFlexHTTPDriver()
+        with patch.object(OT2HTTPDriver, "load_module", return_value="mod") as parent:
+            driver.load_module("heaterShakerModuleV1", "6")
+        assert parent.call_args.args[1] == "C3"
+
+    def test_duplicate_module_numeric_slot_raises_clear_error(self):
+        driver = StubFlexHTTPDriver()
+        driver.config["loaded_modules"]["C3"] = ("module_1", "heaterShakerModuleV1")
+        with pytest.raises(RuntimeError, match="Module already loaded in slot C3"):
+            driver.load_module("heaterShakerModuleV1", "6")
+
+    def test_virtual_load_instrument_accepts_numeric_tiprack_slots(self):
+        d = VirtualFlexHTTPDriver.__new__(VirtualFlexHTTPDriver)
+        d.config = DummyConfig({
+            "loaded_instruments": {}, "loaded_labware": {},
+            "available_tips": {}, "loaded_modules": {},
+        })
+        d.app = None
+        d.pipette_info = {}
+        d.load_labware("opentrons_flex_96_tiprack_1000ul", "1")
+        d.load_instrument("flex_1channel_1000", "left", ["1"])
+        tiprack_id = d.config["loaded_labware"]["D1"][0]
+        assert d.config["loaded_instruments"]["left"]["tip_racks"] == [tiprack_id]
+
+
+class TestLabwareChoices:
+    @staticmethod
+    def _write_def(directory, load_name, display_name, namespace="custom_beta"):
+        definition = {
+            "namespace": namespace,
+            "parameters": {"loadName": load_name},
+            "metadata": {"displayName": display_name},
+        }
+        (directory / f"{load_name}.json").write_text(json.dumps(definition))
+
+    def _driver(self, tmp_path):
+        driver = StubFlexHTTPDriver()
+        driver.custom_labware_dir = tmp_path
+        return driver
+
+    def test_custom_labware_listed_from_directory(self, tmp_path):
+        self._write_def(tmp_path, "nist_stirred_catch", "NIST Stirred Catch")
+        choices = self._driver(tmp_path)._labware_choices()
+        assert choices["custom_beta/nist_stirred_catch"] == "NIST Stirred Catch"
+
+    def test_new_files_appear_without_restart(self, tmp_path):
+        driver = self._driver(tmp_path)
+        assert "custom_beta/late_plate" not in driver._labware_choices()
+        self._write_def(tmp_path, "late_plate", "Late Plate")
+        assert driver._labware_choices()["custom_beta/late_plate"] == "Late Plate"
+
+    def test_order_is_builtin_then_custom_then_modules(self, tmp_path):
+        from AFL.automation.prepare.FlexDeckWebAppMixin import (
+            FLEX_LABWARE_OPTIONS,
+            FLEX_MODULE_OPTIONS,
+        )
+        self._write_def(tmp_path, "b_plate", "b plate")
+        self._write_def(tmp_path, "a_plate", "A plate")
+        keys = list(self._driver(tmp_path)._labware_choices())
+
+        n_builtin = len(FLEX_LABWARE_OPTIONS)
+        assert keys[:n_builtin] == list(FLEX_LABWARE_OPTIONS)
+        assert keys[n_builtin:n_builtin + 2] == ["custom_beta/a_plate", "custom_beta/b_plate"]
+        assert keys[n_builtin + 2:] == list(FLEX_MODULE_OPTIONS)
+
+    def test_missing_display_name_falls_back_to_key(self, tmp_path):
+        (tmp_path / "bare.json").write_text(
+            json.dumps({"namespace": "custom_beta", "parameters": {"loadName": "bare"}})
+        )
+        assert self._driver(tmp_path)._labware_choices()["custom_beta/bare"] == "custom_beta/bare"
+
+    def test_duplicate_definitions_do_not_break_the_dialog(self, tmp_path):
+        self._write_def(tmp_path, "dup", "Dup")
+        (tmp_path / "dup_copy.json").write_text((tmp_path / "dup.json").read_text())
+        assert "custom_beta/dup" in self._driver(tmp_path)._labware_choices()
+
+    def test_builtin_list_has_no_custom_entries(self):
+        from AFL.automation.prepare.FlexDeckWebAppMixin import FLEX_LABWARE_OPTIONS
+        assert all(k.startswith("opentrons/") for k in FLEX_LABWARE_OPTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +430,251 @@ class TestTransferTipDrop:
         assert OT2HTTPDriver.TRASH_ADDRESSABLE_AREA == "fixedTrash"
 
 
+# Fixture ID for a waste chute sharing cutout D3 with a Flex Stacker.  The
+# detection only relies on the "WasteChute" / "NoCover" substrings.
+_CHUTE_WITH_STACKER = "flexStackerModuleV1WithWasteChuteRightAdapterNoCover"
+
+
+def _deck(*entries):
+    return [{"cutoutId": c, "cutoutFixtureId": f} for c, f in entries]
+
+
+def _detect(driver, deck):
+    with patch.object(driver, "_get_deck_configuration", return_value=deck):
+        driver._autodetect_trash_area()
+
+
+class TestWasteChute:
+    def test_chute_with_stacker_detected_as_uncovered(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        assert driver.waste_chute == {"fixture": _CHUTE_WITH_STACKER, "covered": False}
+        assert driver.use_waste_chute_for_tips
+
+    def test_covered_chute_detected(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, _deck(("cutoutD3", "wasteChuteRightAdapterCovered")))
+        assert driver.waste_chute["covered"] is True
+
+    def test_trash_bin_preferred_over_chute_for_tips(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, _deck(
+            ("cutoutA3", "trashBinAdapter"),
+            ("cutoutD3", "wasteChuteRightAdapterNoCover"),
+        ))
+        assert not driver.use_waste_chute_for_tips
+        assert driver._tip_drop_area("any") == "movableTrashA3"
+        assert driver.waste_chute is not None  # still available to the gripper
+
+    def test_chute_outside_d3_is_ignored(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, _deck(("cutoutC3", "wasteChuteRightAdapterNoCover")))
+        assert driver.waste_chute is None
+
+    @pytest.mark.parametrize("channels,expected", [
+        (1, "1ChannelWasteChute"),
+        (8, "8ChannelWasteChute"),
+    ])
+    def test_tip_area_by_pipette_channels(self, channels, expected):
+        driver = StubFlexHTTPDriver()
+        driver.pipette_info = {"left": {"id": "pip", "name": "flex", "channels": channels}}
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        assert driver._tip_drop_area("pip") == expected
+
+    @pytest.mark.parametrize("layout,expected", [
+        ("full96", "96ChannelWasteChute"),
+        ("column", "8ChannelWasteChute"),
+        ("single", "1ChannelWasteChute"),
+    ])
+    def test_96_channel_area_follows_nozzle_layout(self, layout, expected):
+        driver = StubFlexHTTPDriver()
+        driver.pipette_info = {_96CH_MOUNT_KEY: {"id": "p96", "name": "flex_96channel_1000", "channels": 96}}
+        driver.config["loaded_instruments"][_96CH_MOUNT_KEY] = {
+            "pipette_id": "p96", "nozzle_layout": layout,
+        }
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        assert driver._tip_drop_area("p96") == expected
+
+    def test_96_channel_full_rack_refused_by_covered_chute(self):
+        driver = StubFlexHTTPDriver()
+        driver.pipette_info = {_96CH_MOUNT_KEY: {"id": "p96", "name": "flex_96channel_1000", "channels": 96}}
+        _detect(driver, _deck(("cutoutD3", "wasteChuteRightAdapterCovered")))
+        with pytest.raises(RuntimeError, match="covered"):
+            driver._tip_drop_area("p96")
+
+    def test_transfer_drops_tips_in_chute(self):
+        driver = _configured_flex_driver()
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        driver.transfer("1A1", "1A2", 30)
+
+        areas = [
+            params["addressableAreaName"]
+            for cmd, params in driver.executed_commands
+            if cmd == "moveToAddressableAreaForDropTip"
+        ]
+        assert areas and set(areas) == {"1ChannelWasteChute"}
+
+    def _driver_with_plate(self):
+        driver = StubFlexHTTPDriver()
+        driver.config["loaded_labware"]["C2"] = ("lw-1", "plate", {})
+        driver.config["loaded_gripper"] = {"gripper_id": "g", "serial": "g"}
+        return driver
+
+    def test_gripper_discards_labware_into_chute(self):
+        driver = self._driver_with_plate()
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post, \
+             patch.object(driver, "_check_cmd_success"):
+            result = driver.move_labware("C2", "wasteChute")
+
+        params = mock_post.call_args.kwargs["json"]["data"]["params"]
+        assert params["newLocation"] == {"addressableAreaName": "gripperWasteChute"}
+        assert params["strategy"] == "usingGripper"
+        assert "C2" not in driver.config["loaded_labware"]
+        assert result["dest_slot"] == "wasteChute"
+
+    def test_discard_refused_for_covered_chute(self):
+        driver = self._driver_with_plate()
+        _detect(driver, _deck(("cutoutD3", "wasteChuteRightAdapterCovered")))
+        with pytest.raises(RuntimeError, match="uncovered waste chute"):
+            driver.move_labware("C2", "wasteChute")
+        assert "C2" in driver.config["loaded_labware"]
+
+    def test_discard_refused_without_gripper(self):
+        driver = self._driver_with_plate()
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        with pytest.raises(RuntimeError, match="requires the gripper"):
+            driver.move_labware("C2", "wasteChute", use_gripper=False)
+
+    def test_deck_view_labels_chute_and_detects_staging_variant(self):
+        driver = StubFlexHTTPDriver()
+        deck = _deck(("cutoutD3", "stagingAreaSlotWithWasteChuteRightAdapterNoCover"))
+        assert driver._has_staging_area(deck)
+        assert driver._get_flex_slot_info("D3", False, deck)["name"] == "Waste Chute"
+        assert not driver._has_staging_area(_deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+
+
+class TestTipTracking:
+    def _commands(self, driver):
+        return [cmd for cmd, _ in driver.executed_commands]
+
+    def test_failed_transfer_tip_is_discarded_before_next_transfer(self):
+        driver = _configured_flex_driver()
+        driver.fail_on = "aspirate"
+        with pytest.raises(RuntimeError, match="simulated aspirate"):
+            driver.transfer("1A1", "1A2", 30)
+        assert driver.has_tip and driver.tip_contaminated
+
+        driver.executed_commands.clear()
+        driver.transfer("1A1", "1A2", 30)
+
+        cmds = self._commands(driver)
+        assert cmds[:3] == ["moveToAddressableAreaForDropTip", "dropTipInPlace", "pickUpTip"]
+        assert driver.executed_commands[1][1]["pipetteId"] == "flex-left-id"
+        assert driver.tip_contaminated is False
+
+    def test_mix_discards_tip_from_failed_transfer(self):
+        driver = _configured_flex_driver()
+        driver.fail_on = "dispense"
+        with pytest.raises(RuntimeError):
+            driver.transfer("1A1", "1A2", 30)
+
+        driver.executed_commands.clear()
+        driver.mix(10, "1A2")
+        assert self._commands(driver)[:3] == [
+            "moveToAddressableAreaForDropTip", "dropTipInPlace", "pickUpTip",
+        ]
+
+    def test_tip_kept_on_purpose_is_still_reused(self):
+        driver = _configured_flex_driver()
+        driver.transfer("1A1", "1A2", 30, drop_tip=False)
+        assert driver.has_tip and not driver.tip_contaminated
+
+        driver.executed_commands.clear()
+        driver.transfer("1A1", "1A3", 30)
+        assert "pickUpTip" not in self._commands(driver)
+
+    def test_reset_deck_forgets_attached_tip(self):
+        driver = _configured_flex_driver()
+        driver.fail_on = "aspirate"
+        with pytest.raises(RuntimeError):
+            driver.transfer("1A1", "1A2", 30)
+
+        driver.reset_deck()
+        assert driver.has_tip is False
+        assert driver.tip_contaminated is False
+        assert driver.tip_pipette_id is None
+
+    def _driver_with_tiprack(self):
+        driver = _configured_flex_driver()
+        driver.config["loaded_labware"]["D1"] = ("tiprack-left", "opentrons_flex_96_tiprack_50ul", {})
+        driver.config["loaded_gripper"] = {"gripper_id": "g", "serial": "g"}
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        return driver
+
+    @pytest.mark.parametrize("dest", ["wasteChute", "offDeck"])
+    def test_tiprack_leaving_deck_is_forgotten(self, dest):
+        driver = self._driver_with_tiprack()
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post"), \
+             patch.object(driver, "_check_cmd_success"):
+            driver.move_labware("D1", dest)
+
+        assert driver.config["available_tips"]["left"] == []
+        assert driver.config["loaded_instruments"]["left"]["tip_racks"] == []
+
+    def test_tiprack_moved_on_deck_keeps_its_tips(self):
+        driver = self._driver_with_tiprack()
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post"), \
+             patch.object(driver, "_check_cmd_success"):
+            driver.move_labware("D1", "C1")
+
+        assert len(driver.config["available_tips"]["left"]) == 3
+        assert driver.config["loaded_labware"]["C1"][0] == "tiprack-left"
+
+    def test_deck_page_offers_chute_only_when_move_would_accept_it(self):
+        driver = StubFlexHTTPDriver()
+        driver.useful_links = {}
+        driver._labware_choices = lambda: {}
+        with patch.object(driver, "_get_deck_configuration", return_value=[]):
+            _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+            assert '"wasteChuteAvailable": true' in driver.visualize_deck()
+            _detect(driver, _deck(("cutoutD3", "wasteChuteRightAdapterCovered")))
+            assert '"wasteChuteAvailable": false' in driver.visualize_deck()
+
+
+class TestNoTipDisposal:
+    def test_empty_deck_disables_tip_disposal(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, [])
+        assert driver.tip_disposal_available is False
+
+    def test_transfer_refused_before_any_command(self):
+        driver = _configured_flex_driver()
+        _detect(driver, _deck(("cutoutD3", "singleRightSlot")))
+        with patch.object(driver, "_get_deck_configuration", return_value=[]):
+            with pytest.raises(RuntimeError, match="No trash bin or waste chute"):
+                driver.transfer("1A1", "1A2", 30)
+        assert driver.executed_commands == []
+        assert driver.has_tip is False
+
+    def test_transfer_rechecks_deck_before_refusing(self):
+        driver = _configured_flex_driver()
+        _detect(driver, [])
+        # Chute configured in the Opentrons App after startup.
+        with patch.object(driver, "_get_deck_configuration",
+                          return_value=_deck(("cutoutD3", _CHUTE_WITH_STACKER))):
+            driver.transfer("1A1", "1A2", 30)
+        assert driver.tip_disposal_available is True
+        assert any(cmd == "dropTipInPlace" for cmd, _ in driver.executed_commands)
+
+    def test_trash_bin_or_chute_enables_tip_disposal(self):
+        driver = StubFlexHTTPDriver()
+        _detect(driver, _deck(("cutoutA3", "trashBinAdapter")))
+        assert driver.tip_disposal_available is True
+        _detect(driver, _deck(("cutoutD3", _CHUTE_WITH_STACKER)))
+        assert driver.tip_disposal_available is True
+
+
 # ---------------------------------------------------------------------------
 # 5. FlexPrepare MRO sanity
 # ---------------------------------------------------------------------------
@@ -348,9 +693,8 @@ class TestFlexPrepareMRO:
         prepare_idx = mro.index(PrepareDriver)
         assert flex_idx < prepare_idx
 
-    def test_flex_prepare_defaults_include_deck_configuration(self):
-        assert "deck_configuration" in FlexPrepare.defaults
-        assert len(FlexPrepare.defaults["deck_configuration"]) >= 1
+    def test_deck_configuration_is_not_a_persisted_default(self):
+        assert "deck_configuration" not in FlexPrepare.gather_defaults()
 
     def test_gather_defaults_merges_all_parent_defaults(self):
         defaults = FlexPrepare.gather_defaults()
@@ -358,10 +702,111 @@ class TestFlexPrepareMRO:
         assert "robot_ip" in defaults
         assert "loaded_labware" in defaults
         # From FlexHTTPDriver
-        assert "deck_configuration" in defaults
         assert "loaded_gripper" in defaults
         # From OT2Prepare/PrepareDriver
         assert "stocks" in defaults
+
+
+class _Step:
+    def __init__(self, source, volume):
+        self.source = source
+        self.volume = volume
+
+
+class _BalancedTarget:
+    def __init__(self, steps):
+        self.protocol = steps
+
+
+class StubFlexPrepare(FlexPrepare):
+    """FlexPrepare with no robot: the Flex transfer() override (tip-disposal
+    check) still runs, only OT2HTTPDriver.transfer is replaced."""
+
+    def __init__(self):
+        self.app = None
+        self.data = {"prepare": {"executed_transfers": []}}
+        self.config = DummyConfig({
+            "deck": {"D3A1": "Water"},
+            "prep_targets": ["D1A1", "D1A2"],
+            "stock_transfer_params": {"default": {"drop_tip": True}},
+            "stock_mix_order": [],
+            "catch_protocol": {"dest": "C1A1", "volume": 300},
+        })
+        self.stocks = []
+        self.last_target_location = None
+        self.transfers = []
+
+    def _fake_parent_transfer(self, source, dest, volume, *args, **kwargs):
+        self.transfers.append((source, dest, float(volume), kwargs))
+        return {"source": source, "dest": dest, "subtransfers_ul": [float(volume)]}
+
+
+def _patched_prepare():
+    driver = StubFlexPrepare()
+    return driver, patch.object(OT2HTTPDriver, "transfer", autospec=True,
+                                side_effect=StubFlexPrepare._fake_parent_transfer)
+
+
+class TestAlignScript:
+    def test_flex_align_script_declares_flex_robot(self, tmp_path):
+        driver = StubFlexHTTPDriver()
+        driver.config["loaded_labware"]["C2"] = (
+            "pl", "plate",
+            {"definition": {"parameters": {"loadName": "nest_96_wellplate_2ml_deep"},
+                            "namespace": "opentrons", "version": 2}},
+        )
+        out = tmp_path / "align.py"
+        driver.make_align_script(str(out))
+        src = out.read_text()
+        compile(src, str(out), "exec")
+        assert "requirements = {'robotType': 'Flex', 'apiLevel': '2.16'}" in src
+        assert "protocol.load_labware('nest_96_wellplate_2ml_deep', 'C2'" in src
+
+    def test_ot2_align_script_header_unchanged(self):
+        header = "\n".join(OT2HTTPDriver._align_script_header(None))
+        assert "'apiLevel': '2.13'" in header
+        assert "robotType" not in header
+
+
+class TestFlexPrepareWorkflow:
+    def test_preparation_methods_come_from_ot2prepare(self):
+        from AFL.automation.prepare.OT2Prepare import OT2Prepare
+        for name in ("resolve_destination", "execute_preparation", "execute_preparation_plan",
+                     "transfer_to_catch", "get_transfer_params", "process_stocks"):
+            owner = next(c for c in FlexPrepare.__mro__ if name in vars(c))
+            assert owner is OT2Prepare, name
+        assert next(c for c in FlexPrepare.__mro__ if "transfer" in vars(c)) is FlexHTTPDriver
+
+    def test_resolve_destination_pops_prep_target(self):
+        driver = StubFlexPrepare()
+        assert driver.resolve_destination(None) == "D1A1"
+        assert driver.config["prep_targets"] == ["D1A2"]
+
+    def test_execute_preparation_transfers_and_records(self):
+        driver, patcher = _patched_prepare()
+        with patcher:
+            ok = driver.execute_preparation({}, _BalancedTarget([_Step("D3A1", 120)]), "D1A1")
+
+        assert ok is True
+        assert driver.transfers == [("D3A1", "D1A1", 120.0, {"drop_tip": True})]
+        assert driver.last_target_location == "D1A1"
+        assert driver.data["prepare"]["executed_transfers"][0]["source_stock_name"] == "Water"
+
+    def test_transfer_to_catch_uses_last_target(self):
+        driver, patcher = _patched_prepare()
+        driver.last_target_location = "D1A1"
+        with patcher:
+            driver.transfer_to_catch()
+        assert driver.transfers == [("D1A1", "C1A1", 300.0, {})]
+
+    def test_preparation_stops_before_moving_liquid_without_tip_disposal(self):
+        driver, patcher = _patched_prepare()
+        driver.tip_disposal_available = False
+        with patcher, patch.object(driver, "_get_deck_configuration", return_value=[]), \
+             pytest.warns(UserWarning, match="No trash bin or waste chute"):
+            ok = driver.execute_preparation({}, _BalancedTarget([_Step("D3A1", 120)]), "D1A1")
+        assert ok is False
+        assert driver.transfers == []
 
 
 # ---------------------------------------------------------------------------
@@ -414,31 +859,26 @@ class TestGripperSupport:
         mock_get.assert_called_once()
         assert "/instruments" in mock_get.call_args.kwargs["url"]
 
-    def test_load_gripper_issues_load_gripper_command(self):
+    def test_load_gripper_sends_no_run_command(self):
+        """API v4+ makes the gripper implicitly available; no loadGripper command."""
         driver = StubFlexHTTPDriver()
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get, \
              patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
             mock_get.return_value = _gripper_instruments_response(serial="GRPV9999")
-            mock_post.return_value = _load_gripper_cmd_response("gripper-run-xyz")
             result = driver.load_gripper()
 
-        posted = mock_post.call_args.kwargs["json"]["data"]
-        assert posted["commandType"] == "loadGripper"
-        assert posted["params"]["gripperId"] == "GRPV9999"
-        assert result == "gripper-run-xyz"
+        mock_post.assert_not_called()
+        assert result == "GRPV9999"
 
-    def test_load_gripper_stores_result_in_config(self):
+    def test_load_gripper_stores_serial_in_config(self):
         driver = StubFlexHTTPDriver()
 
-        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get, \
-             patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.get") as mock_get:
             mock_get.return_value = _gripper_instruments_response(serial="GRPV1234")
-            mock_post.return_value = _load_gripper_cmd_response("gripper-run-abc")
             driver.load_gripper()
 
-        assert driver.config["loaded_gripper"]["gripper_id"] == "gripper-run-abc"
-        assert driver.config["loaded_gripper"]["serial"] == "GRPV1234"
+        assert driver.config["loaded_gripper"] == {"gripper_id": "GRPV1234", "serial": "GRPV1234"}
 
     def test_load_gripper_raises_when_no_gripper_attached(self):
         driver = StubFlexHTTPDriver()
@@ -448,35 +888,9 @@ class TestGripperSupport:
             with pytest.raises(RuntimeError, match="No gripper found"):
                 driver.load_gripper()
 
-    def test_after_run_created_reloads_gripper_when_previously_loaded(self):
-        driver = StubFlexHTTPDriver()
-        driver.config["loaded_gripper"] = {"gripper_id": "old-id", "serial": "GRPV1234"}
-        load_gripper_calls = []
-
-        def fake_load_gripper():
-            load_gripper_calls.append(True)
-
-        driver.load_gripper = fake_load_gripper
-        driver._after_run_created("run-new")
-
-        assert load_gripper_calls == [True]
-
-    def test_after_run_created_skips_gripper_reload_when_not_loaded(self):
-        driver = StubFlexHTTPDriver()
-        assert driver.config.get("loaded_gripper") is None
-        load_gripper_calls = []
-
-        def fake_load_gripper():
-            load_gripper_calls.append(True)
-
-        driver.load_gripper = fake_load_gripper
-        driver._after_run_created("run-new")
-
-        assert load_gripper_calls == []
-
     def test_move_labware_with_gripper_sends_correct_command(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["3"] = ("labware-id-1", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D3"] = ("labware-id-1", "my_plate", {"definition": {}})
         driver.config["loaded_gripper"] = {"gripper_id": "g-1", "serial": "GRPV1234"}
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
@@ -492,34 +906,33 @@ class TestGripperSupport:
 
     def test_move_labware_updates_loaded_labware_tracking(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["3"] = ("labware-id-1", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D3"] = ("labware-id-1", "my_plate", {"definition": {}})
         driver.config["loaded_gripper"] = {"gripper_id": "g-1", "serial": "GRPV1234"}
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
             mock_post.return_value = _FakeResponse({"data": {"result": {}, "status": "succeeded"}})
             driver.move_labware("3", "5")
 
-        assert "3" not in driver.config["loaded_labware"]
-        assert "5" in driver.config["loaded_labware"]
-        assert driver.config["loaded_labware"]["5"][0] == "labware-id-1"
+        assert "D3" not in driver.config["loaded_labware"]
+        assert driver.config["loaded_labware"]["C2"][0] == "labware-id-1"
 
     def test_move_labware_to_offdeck_removes_from_tracking(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["3"] = ("labware-id-1", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D3"] = ("labware-id-1", "my_plate", {"definition": {}})
         driver.config["loaded_gripper"] = {"gripper_id": "g-1", "serial": "GRPV1234"}
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
             mock_post.return_value = _FakeResponse({"data": {"result": {}, "status": "succeeded"}})
             result = driver.move_labware("3", "offDeck")
 
-        assert "3" not in driver.config["loaded_labware"]
+        assert "D3" not in driver.config["loaded_labware"]
         assert "offDeck" not in driver.config["loaded_labware"]
         posted_params = mock_post.call_args.kwargs["json"]["data"]["params"]
         assert posted_params["newLocation"] == "offDeck"
 
     def test_move_labware_manual_uses_correct_strategy(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["1"] = ("labware-id-2", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D1"] = ("labware-id-2", "my_plate", {"definition": {}})
         # No gripper needed for manual move
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
@@ -538,7 +951,7 @@ class TestGripperSupport:
 
     def test_move_labware_raises_when_gripper_not_loaded(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["3"] = ("labware-id-1", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D3"] = ("labware-id-1", "my_plate", {"definition": {}})
         # loaded_gripper is None by default
 
         with pytest.raises(RuntimeError, match="Gripper is not loaded"):
@@ -546,15 +959,15 @@ class TestGripperSupport:
 
     def test_move_labware_return_value(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["3"] = ("labware-id-1", "my_plate", {"definition": {}})
+        driver.config["loaded_labware"]["D3"] = ("labware-id-1", "my_plate", {"definition": {}})
         driver.config["loaded_gripper"] = {"gripper_id": "g-1", "serial": "GRPV1234"}
 
         with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as mock_post:
             mock_post.return_value = _FakeResponse({"data": {"result": {}, "status": "succeeded"}})
             result = driver.move_labware("3", "6")
 
-        assert result["source_slot"] == "3"
-        assert result["dest_slot"] == "6"
+        assert result["source_slot"] == "D3"
+        assert result["dest_slot"] == "C3"
         assert result["strategy"] == "usingGripper"
         assert result["labware_id"] == "labware-id-1"
 
@@ -570,8 +983,8 @@ def _96ch_stub():
     """StubFlexHTTPDriver pre-configured with a 96-channel and two tipracks."""
     from itertools import chain
     driver = StubFlexHTTPDriver()
-    driver.config["loaded_labware"]["1"] = ("rack-A", "opentrons_flex_96_tiprack_1000ul", {"definition": {"wells": {w: {} for w in TIPRACK_WELLS}, "metadata": {"displayName": "t"}}})
-    driver.config["loaded_labware"]["2"] = ("rack-B", "opentrons_flex_96_tiprack_1000ul", {"definition": {"wells": {w: {} for w in TIPRACK_WELLS}, "metadata": {"displayName": "t"}}})
+    driver.config["loaded_labware"]["D1"] = ("rack-A", "opentrons_flex_96_tiprack_1000ul", {"definition": {"wells": {w: {} for w in TIPRACK_WELLS}, "metadata": {"displayName": "t"}}})
+    driver.config["loaded_labware"]["D2"] = ("rack-B", "opentrons_flex_96_tiprack_1000ul", {"definition": {"wells": {w: {} for w in TIPRACK_WELLS}, "metadata": {"displayName": "t"}}})
     driver.config["loaded_instruments"][_96CH_MOUNT_KEY] = {
         "name": "flex_96channel_1000",
         "pipette_id": "pip-96ch",
@@ -592,7 +1005,7 @@ class TestNinetyChannelSupport:
     def test_load_instrument_96ch_uses_api_left_mount(self):
         """The loadPipette command must use 'left' even though we track under '96channel'."""
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
+        driver.config["loaded_labware"]["D1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
         posted = []
 
         class _Resp:
@@ -610,7 +1023,7 @@ class TestNinetyChannelSupport:
 
     def test_load_instrument_96ch_stored_under_96channel_key(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
+        driver.config["loaded_labware"]["D1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
 
         class _Resp:
             status_code = 201
@@ -627,7 +1040,7 @@ class TestNinetyChannelSupport:
 
     def test_load_instrument_96ch_tips_stored_under_96channel_key(self):
         driver = StubFlexHTTPDriver()
-        driver.config["loaded_labware"]["1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
+        driver.config["loaded_labware"]["D1"] = ("r1", "opentrons_flex_96_tiprack_1000ul", {})
 
         class _Resp:
             status_code = 201
@@ -749,6 +1162,12 @@ class TestNinetyChannelSupport:
 # ---------------------------------------------------------------------------
 
 class TestVirtualFlexHTTPDriver:
+    @pytest.fixture(autouse=True)
+    def _isolated_home(self, monkeypatch, tmp_path):
+        # The custom labware directory lives under $HOME/.afl (not AFL_HOME);
+        # keep the real one untouched.
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
     def _driver(self):
         return VirtualFlexHTTPDriver()
 
@@ -765,22 +1184,20 @@ class TestVirtualFlexHTTPDriver:
     def test_load_labware_stores_in_config(self):
         d = self._driver()
         labware_id = d.load_labware("corning_96_wellplate_360ul_flat", "3")
-        assert "3" in d.config["loaded_labware"]
-        assert d.config["loaded_labware"]["3"][0] == labware_id
-        assert d.config["loaded_labware"]["3"][1] == "corning_96_wellplate_360ul_flat"
+        assert d.config["loaded_labware"]["D3"][0] == labware_id
+        assert d.config["loaded_labware"]["D3"][1] == "corning_96_wellplate_360ul_flat"
 
     def test_load_labware_definition_contains_standard_wells(self):
         d = self._driver()
         d.load_labware("my_plate", "1")
-        definition = d.config["loaded_labware"]["1"][2]
+        definition = d.config["loaded_labware"]["D1"][2]
         assert "A1" in definition["definition"]["wells"]
         assert "H12" in definition["definition"]["wells"]
 
     def test_load_module_stores_in_config(self):
         d = self._driver()
         module_id = d.load_module("heaterShakerModuleV1", "6")
-        assert "6" in d.config["loaded_modules"]
-        assert d.config["loaded_modules"]["6"][0] == module_id
+        assert d.config["loaded_modules"]["C3"][0] == module_id
 
     # --- instruments ---
 
@@ -876,16 +1293,41 @@ class TestVirtualFlexHTTPDriver:
         d.load_labware("my_plate", "3")
         d.load_gripper()
         d.move_labware("3", "5")
-        assert "3" not in d.config["loaded_labware"]
-        assert "5" in d.config["loaded_labware"]
+        assert "D3" not in d.config["loaded_labware"]
+        assert "C2" in d.config["loaded_labware"]
 
     def test_move_labware_offdeck_removes_from_tracking(self):
         d = self._driver()
         d.load_labware("my_plate", "3")
         d.load_gripper()
         d.move_labware("3", "offDeck")
-        assert "3" not in d.config["loaded_labware"]
+        assert "D3" not in d.config["loaded_labware"]
         assert "offDeck" not in d.config["loaded_labware"]
+
+    def test_virtual_deck_has_uncovered_chute_and_trash_bin(self):
+        d = self._driver()
+        assert d.waste_chute == {"fixture": "wasteChuteRightAdapterNoCover", "covered": False}
+        assert d.TRASH_ADDRESSABLE_AREA == "movableTrashA3"
+        assert d.use_waste_chute_for_tips is False
+
+    def test_virtual_discard_tiprack_in_chute_forgets_its_tips(self):
+        d = self._driver()
+        d.load_labware("opentrons_flex_96_tiprack_1000ul", "1")
+        d.load_instrument("flex_1channel_1000", "left", ["1"])
+        d.load_gripper()
+
+        result = d.move_labware("1", "wasteChute")
+
+        assert result["dest_slot"] == "wasteChute"
+        assert "D1" not in d.config["loaded_labware"]
+        assert "WASTECHUTE" not in d.config["loaded_labware"]
+        assert d.config["available_tips"]["left"] == []
+
+    def test_virtual_discard_requires_gripper(self):
+        d = self._driver()
+        d.load_labware("my_plate", "3")
+        with pytest.raises(RuntimeError, match="requires the gripper"):
+            d.move_labware("3", "wasteChute", use_gripper=False)
 
     def test_move_labware_without_gripper_raises(self):
         d = self._driver()
@@ -967,9 +1409,9 @@ class TestVirtualFlexHTTPDriver:
 
     # --- deck config / run ---
 
-    def test_deck_configuration_does_not_raise(self):
+    def test_virtual_deck_configuration_is_fixed_layout(self):
         d = self._driver()
-        d._apply_deck_configuration("virtual-run")  # must not raise
+        assert d._get_deck_configuration() == VIRTUAL_DECK_CONFIGURATION
 
     def test_ensure_run_exists_returns_virtual_id(self):
         d = self._driver()

@@ -956,7 +956,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         try:
             if slot in self.config["loaded_modules"].keys():
                 # todo: check if same module
-                raise RuntimeError(f"Module already loaded in slot {slot}: {self.config['loaded_modules']['slot']}.  Overwrite not supported.")
+                raise RuntimeError(f"Module already loaded in slot {slot}: {self.config['loaded_modules'][slot]}.  Overwrite not supported.")
 
             # Prepare the loadLabware command
             command_dict = {
@@ -1150,6 +1150,14 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         key = str(name).strip().lower()
         normalized = self.PIPETTE_NAME_ALIASES.get(key, key)
         return normalized
+
+    def _tip_drop_area(self, pipette_id):
+        """Return the addressable area to drop *pipette_id*'s tip into.
+
+        Override in subclasses whose trash area depends on the pipette
+        (e.g. the Flex waste chute).
+        """
+        return self.TRASH_ADDRESSABLE_AREA
 
     def _api_slot_name(self, slot):
         """Return the slot name to pass to the HTTP API. Override in subclasses for robots with different slot naming."""
@@ -1516,7 +1524,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "moveToAddressableAreaForDropTip",
                     {
                         "pipetteId": tip_pipette_id,
-                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
+                        "addressableAreaName": self._tip_drop_area(tip_pipette_id),
                         "offset": {"x": 0, "y": 0, "z": 10},
                         "alternateDropLocation": False,
                     },
@@ -1536,7 +1544,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "moveToAddressableAreaForDropTip",
                     {
                         "pipetteId": tip_pipette_id,
-                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
+                        "addressableAreaName": self._tip_drop_area(tip_pipette_id),
                         "offset": {"x": 0, "y": 0, "z": 10},
                         "alternateDropLocation": False,
                     },
@@ -1807,7 +1815,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 # in it: Opentrons incompetence
                 self._execute_atomic_command("moveToAddressableAreaForDropTip", {
                         "pipetteId": pipette_id,
-                        "addressableAreaName": self.TRASH_ADDRESSABLE_AREA,
+                        "addressableAreaName": self._tip_drop_area(pipette_id),
                         "offset": {
                             "x": 0,
                             "y": 0,
@@ -2551,6 +2559,24 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             status.append(self.get_tip_status(m))
         return "\n".join(status)
 
+    def _align_script_header(self):
+        """Return the import/metadata lines of the alignment script.
+
+        Override in subclasses for robots that need different protocol
+        requirements (e.g. the Flex).
+        """
+        return [
+            "from opentrons import protocol_api",
+            "",
+            "metadata = {",
+            "    'protocolName': 'Alignment Check',",
+            "    'author': 'AFL Auto-Generated',",
+            "    'description': 'Script for aligning and testing deck configuration',",
+            "    'apiLevel': '2.13'",
+            "}",
+            "",
+        ]
+
     def make_align_script(self, filename: str):
         """
         Generate an Opentrons Python Protocol API script to verify alignment.
@@ -2559,18 +2585,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         and performs a movement to the top of well A1 for each labware using each pipette.
         This allows for visual verification of calibration and alignment.
         """
-        script = []
-        
-        # Header
-        script.append("from opentrons import protocol_api")
-        script.append("")
-        script.append("metadata = {")
-        script.append("    'protocolName': 'Alignment Check',")
-        script.append("    'author': 'AFL Auto-Generated',")
-        script.append("    'description': 'Script for aligning and testing deck configuration',")
-        script.append("    'apiLevel': '2.13'")
-        script.append("}")
-        script.append("")
+        script = self._align_script_header()
         script.append("def run(protocol: protocol_api.ProtocolContext):")
         
         indent = "    "

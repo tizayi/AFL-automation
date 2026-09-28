@@ -14,12 +14,31 @@ This makes it suitable for:
 * Docker-compose-based CI pipelines.
 """
 
+import copy
 import uuid
 
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2HTTPDriver import TIPRACK_WELLS
 from AFL.automation.prepare.FlexHTTPDriver import FlexHTTPDriver, _96CH_MOUNT_KEY
 from AFL.automation.shared.utilities import listify
+
+# Deck layout reported by the virtual robot: left/center columns as plain
+# slots, A3 as trash bin (tips go here), B3/C3 as staging areas (enables
+# B4/C4), and an uncovered waste chute in D3 so the gripper can discard labware.
+VIRTUAL_DECK_CONFIGURATION = [
+    {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutA1"},
+    {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutB1"},
+    {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutC1"},
+    {"cutoutFixtureId": "singleLeftSlot",  "cutoutId": "cutoutD1"},
+    {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutA2"},
+    {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutB2"},
+    {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutC2"},
+    {"cutoutFixtureId": "singleCenterSlot","cutoutId": "cutoutD2"},
+    {"cutoutFixtureId": "trashBinAdapter", "cutoutId": "cutoutA3"},
+    {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutB3"},
+    {"cutoutFixtureId": "stagingAreaRightSlot", "cutoutId": "cutoutC3"},
+    {"cutoutFixtureId": "wasteChuteRightAdapterNoCover", "cutoutId": "cutoutD3"},
+]
 
 
 class VirtualFlexHTTPDriver(FlexHTTPDriver):
@@ -47,6 +66,7 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
         self.pipette_info = {}
         self.min_transfer = None
         self.max_transfer = None
+        self._autodetect_trash_area()
         self.log_info("Virtual Flex initialised (no hardware)")
 
     def _update_pipettes(self):
@@ -67,12 +87,11 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
         return "virtual-run"
 
     # ------------------------------------------------------------------
-    # Deck configuration — no HTTP, just log
+    # Deck configuration — fixed virtual layout, no HTTP
     # ------------------------------------------------------------------
 
-    def _apply_deck_configuration(self):
-        deck_config = self.config.get("deck_configuration", [])
-        self.log_info(f"Virtual: deck configuration applied ({len(deck_config)} fixture(s))")
+    def _get_deck_configuration(self):
+        return copy.deepcopy(VIRTUAL_DECK_CONFIGURATION)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -150,7 +169,7 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
             mount = _96CH_MOUNT_KEY
         else:
             mount = str(mount).strip().lower()
-        tip_rack_slots = [str(s) for s in listify(tip_rack_slots)]
+        tip_rack_slots = [self._normalize_slot(s) for s in listify(tip_rack_slots)]
 
         pipette_id = self._generate_id("pipette")
         max_vol = self._pipette_max_volume(pipette_name)
@@ -215,41 +234,11 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
         return gripper_id
 
     def move_labware(self, source_slot, dest_slot, use_gripper=True):
-        """Simulate a labware move by updating config tracking."""
-        source_slot = self._normalize_slot(source_slot)
-        if source_slot not in self.config["loaded_labware"]:
-            raise ValueError(
-                f"No labware loaded in slot {source_slot!r}. "
-                f"Loaded slots: {list(self.config['loaded_labware'].keys())}"
-            )
-
-        if use_gripper and not self.config.get("loaded_gripper"):
-            raise RuntimeError(
-                "Gripper is not loaded. Call load_gripper() before move_labware()."
-            )
-
-        labware_id, labware_name, labware_data = self.config["loaded_labware"][source_slot]
-        strategy = "usingGripper" if use_gripper else "manualMoveWithoutPause"
-        dest_str = str(dest_slot).strip().lower()
-
-        del self.config["loaded_labware"][source_slot]
-        if dest_str != "offdeck":
-            flex_dest = self._normalize_slot(dest_slot)
-            self.config["loaded_labware"][flex_dest] = (labware_id, labware_name, labware_data)
-        else:
-            flex_dest = "offDeck"
-        self.config._update_history()
-
-        self.log_info(
-            f"Virtual: moved '{labware_name}' from slot {source_slot} to "
-            f"{flex_dest} ({strategy})"
+        """Simulate a labware move: same validation and tracking as the real driver, no HTTP."""
+        source_slot, _, dest_label, strategy = self._plan_labware_move(
+            source_slot, dest_slot, use_gripper
         )
-        return {
-            "source_slot": source_slot,
-            "dest_slot": flex_dest,
-            "strategy": strategy,
-            "labware_id": labware_id,
-        }
+        return self._record_labware_move(source_slot, dest_label, strategy)
 
     # ------------------------------------------------------------------
     # Atomic command execution — real tip-state tracking, no HTTP
@@ -293,6 +282,7 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
         else:
             self.log_info(f"Virtual: {command_type}")
 
+        self._track_tip(command_type, params.get("pipetteId"))
         return True
 
     # ------------------------------------------------------------------
@@ -309,6 +299,8 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
         self.config["loaded_gripper"] = None
         self.pipette_info = {}
         self.has_tip = False
+        self.tip_pipette_id = None
+        self.tip_contaminated = False
         self.last_pipette = None
         self.run_id = None
         self.modules = {}

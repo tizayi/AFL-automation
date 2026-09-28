@@ -1,17 +1,19 @@
 from AFL.automation.prepare.FlexHTTPDriver import FlexHTTPDriver
+from AFL.automation.prepare.OT2Prepare import OT2Prepare
 from AFL.automation.prepare.PrepareDriver import PrepareDriver
 
 
-class FlexPrepare(FlexHTTPDriver, PrepareDriver):
+class FlexPrepare(FlexHTTPDriver, OT2Prepare):
     """Combined Flex robot driver and mass-balance preparation engine.
 
-    Mirrors :class:`~AFL.automation.prepare.OT2Prepare.OT2Prepare` but uses
+    Reuses :class:`~AFL.automation.prepare.OT2Prepare.OT2Prepare`'s
+    robot-agnostic preparation logic (``execute_preparation``,
+    ``transfer_to_catch``, multi-step plans, stock ordering) with
     :class:`FlexHTTPDriver` as the hardware backend.
 
     The multiple-inheritance order (FlexHTTPDriver first) means that
     :meth:`transfer` and all hardware methods resolve to FlexHTTPDriver, while
-    preparation planning methods (``execute_preparation``, ``set_stocks``, etc.)
-    come from PrepareDriver.
+    preparation methods come from OT2Prepare and PrepareDriver.
     """
 
     defaults = {
