@@ -101,28 +101,42 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     tip_contaminated = False
 
     PIPETTE_NAME_ALIASES = {
-        # Full names pass through unchanged.
-        "flex_1channel_50":    "flex_1channel_50",
-        "flex_1channel_1000":  "flex_1channel_1000",
-        "flex_8channel_50":    "flex_8channel_50",
-        "flex_8channel_1000":  "flex_8channel_1000",
-        "flex_96channel_1000": "flex_96channel_1000",
-        # Convenient shorthand aliases.
-        "flex_50":    "flex_1channel_50",
-        "flex_1000":  "flex_1channel_1000",
-        "flex_8_50":  "flex_8channel_50",
-        "flex_8_1000": "flex_8channel_1000",
-        "flex_96":    "flex_96channel_1000",
+        # --- Hardware-Level Names (Pass through cleanly) ---
+        "p50_single_flex":      "p50_single_flex",
+        "p1000_single_flex":    "p1000_single_flex",
+        "p50_multi_flex":       "p50_multi_flex",
+        "p1000_multi_flex":     "p1000_multi_flex",
+        "p1000_96":             "p1000_96",
+        "p200_96":              "p200_96",
+        "p1000_multi_em_flex":  "p1000_multi_em_flex",
+
+        # --- Python Protocol API Names (Translated to Hardware Names) ---
+        "flex_1channel_50":    "p50_single_flex",
+        "flex_1channel_1000":  "p1000_single_flex",
+        "flex_8channel_50":    "p50_multi_flex",
+        "flex_8channel_1000":  "p1000_multi_flex",
+        "flex_96channel_1000": "p1000_96",
+        "flex_96channel_200":  "p200_96",
+
+        # --- Convenient Shorthand Aliases ---
+        "flex_50":              "p50_single_flex",
+        "flex_1000":            "p1000_single_flex",
+        "flex_8_50":            "p50_multi_flex",
+        "flex_8_1000":          "p1000_multi_flex",
+        "flex_96":              "p1000_96",
+        "flex_96_200":          "p200_96",
     }
 
     EXPECTED_TIPRACK_TOKEN = {
-        "flex_1channel_50":    "50ul",
-        "flex_1channel_1000":  "1000ul",
-        "flex_8channel_50":    "50ul",
-        "flex_8channel_1000":  "1000ul",
-        "flex_96channel_1000": "1000ul",
+        # Keyed to the resolved hardware names
+        "p50_single_flex":      "50ul",
+        "p1000_single_flex":    "1000ul",
+        "p50_multi_flex":       "50ul",
+        "p1000_multi_flex":     "1000ul",
+        "p1000_96":             "1000ul",
+        "p200_96":              "200ul",
+        "p1000_multi_em_flex":  "1000ul",
     }
-
     # Maps a trashBinAdapter cutout ID to the addressable area name used when
     # dropping tips.  Covers all 8 non-center column positions where the trash
     # bin can legally be placed on the Flex deck.
@@ -725,6 +739,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         :meth:`OT2HTTPDriver.load_instrument`.
         """
         pipette_name = self._normalize_pipette_name(name)
+        print(pipette_name)
         if "96channel" not in pipette_name:
             return super().load_instrument(name, mount, tip_rack_slots, reload=reload, **kwargs)
 
