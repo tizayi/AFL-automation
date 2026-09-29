@@ -218,9 +218,9 @@ class TestClassAttributes:
 
     def test_flex_short_aliases_resolve_correctly(self):
         driver = StubFlexHTTPDriver()
-        assert driver._normalize_pipette_name("flex_50") == "flex_1channel_50"
-        assert driver._normalize_pipette_name("flex_1000") == "flex_1channel_1000"
-        assert driver._normalize_pipette_name("flex_96") == "flex_96channel_1000"
+        assert driver._normalize_pipette_name("flex_50") == "p50_single_flex"
+        assert driver._normalize_pipette_name("flex_1000") == "p1000_single_flex"
+        assert driver._normalize_pipette_name("flex_96") == "p1000_96"
 
     def test_expected_tiprack_tokens_cover_all_pipettes(self):
         for pipette_name in FlexHTTPDriver.PIPETTE_NAME_ALIASES.values():
@@ -1019,7 +1019,7 @@ class TestNinetyChannelSupport:
             posted = mock_post.call_args.kwargs["json"]["data"]["params"]
 
         assert posted["mount"] == "left"
-        assert posted["pipetteName"] == "flex_96channel_1000"
+        assert posted["pipetteName"] == "p1000_96"
 
     def test_load_instrument_96ch_stored_under_96channel_key(self):
         driver = StubFlexHTTPDriver()
@@ -1036,7 +1036,7 @@ class TestNinetyChannelSupport:
 
         assert _96CH_MOUNT_KEY in driver.config["loaded_instruments"]
         assert "left" not in driver.config["loaded_instruments"]
-        assert driver.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "flex_96channel_1000"
+        assert driver.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "p1000_96"
 
     def test_load_instrument_96ch_tips_stored_under_96channel_key(self):
         driver = StubFlexHTTPDriver()
@@ -1207,7 +1207,7 @@ class TestVirtualFlexHTTPDriver:
         pipette_id = d.load_instrument("flex_1channel_1000", "left", ["2"])
         assert "left" in d.config["loaded_instruments"]
         assert d.config["loaded_instruments"]["left"]["pipette_id"] == pipette_id
-        assert d.config["loaded_instruments"]["left"]["name"] == "flex_1channel_1000"
+        assert d.config["loaded_instruments"]["left"]["name"] == "p1000_single_flex"
 
     def test_load_instrument_populates_tips(self):
         d = self._driver()
@@ -1359,7 +1359,7 @@ class TestVirtualFlexHTTPDriver:
         d.load_instrument("flex_96channel_1000", "96channel", ["1"])
         assert _96CH_MOUNT_KEY in d.config["loaded_instruments"]
         # The 96-channel instrument is recorded under its own key
-        assert d.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "flex_96channel_1000"
+        assert d.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "p1000_96"
 
     def test_virtual_96ch_left_mount_remapped_to_96ch_key(self):
         """Even if user passes mount='left' for the 96-ch, driver normalises it."""
@@ -1368,7 +1368,7 @@ class TestVirtualFlexHTTPDriver:
         d.load_labware("opentrons_flex_96_tiprack_1000ul", "1")
         d.load_instrument("flex_96channel_1000", "left", ["1"])
         assert _96CH_MOUNT_KEY in d.config["loaded_instruments"]
-        assert d.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "flex_96channel_1000"
+        assert d.config["loaded_instruments"][_96CH_MOUNT_KEY]["name"] == "p1000_96"
 
     def test_virtual_96ch_channels_is_96(self):
         d = self._driver()
@@ -1416,3 +1416,266 @@ class TestVirtualFlexHTTPDriver:
     def test_ensure_run_exists_returns_virtual_id(self):
         d = self._driver()
         assert d._ensure_run_exists() == "virtual-run"
+
+
+# ---------------------------------------------------------------------------
+# 8. Fixes verified against a real Flex (robot software 9.1.2)
+# ---------------------------------------------------------------------------
+
+class _JsonResp:
+    def __init__(self, body, status_code=200):
+        self._body = body
+        self.status_code = status_code
+        self.text = json.dumps(body)
+
+    def json(self):
+        return self._body
+
+
+# GET /modules as returned by the Flex with Opentrons-Version: 4.
+_FLEX_MODULES_RESPONSE = {
+    "data": [
+        {
+            "moduleModel": "heaterShakerModuleV1",
+            "data": {
+                "status": "running",
+                "labwareLatchStatus": "idle_closed",
+                "speedStatus": "holding at target",
+                "currentSpeed": 294,
+                "targetSpeed": 300,
+                "temperatureStatus": "idle",
+                "currentTemperature": 26.6,
+            },
+        },
+        {"moduleModel": "flexStackerModuleV1", "data": {"status": "idle"}},
+    ],
+    "meta": {"cursor": 0, "totalLength": 2},
+}
+
+# A moveToWell that hit something, as returned by the Flex.
+_COLLISION_RESPONSE = {
+    "data": {
+        "id": "cmd-1",
+        "commandType": "moveToWell",
+        "status": "failed",
+        "error": {
+            "errorType": "stallOrCollision",
+            "errorCode": "2003",
+            "detail": "Stall or Collision Detected",
+            "wrappedErrors": [
+                {"errorType": "StallOrCollisionDetectedError", "errorCode": "2003",
+                 "detail": "collision_detected (head_l)", "wrappedErrors": []}
+            ],
+        },
+    }
+}
+
+
+class TestHeaterShakerStatus:
+    def _get(self, body, status_code=200):
+        return patch(
+            "AFL.automation.prepare.OT2HTTPDriver.requests.get",
+            return_value=_JsonResp(body, status_code),
+        )
+
+    def test_reads_flex_v4_modules_format(self):
+        driver = StubFlexHTTPDriver()
+        with self._get(_FLEX_MODULES_RESPONSE):
+            assert driver.get_shake_rpm() == ("holding at target", 294, 300)
+            assert driver.get_shaker_temp() == (26.6, None)
+            assert driver.get_shake_latch_status() == "idle_closed"
+
+    def test_reads_legacy_modules_format(self):
+        driver = StubFlexHTTPDriver()
+        legacy = {"modules": [{"moduleModel": "heaterShakerModuleV1",
+                               "data": {"currentTemp": 25.0, "targetTemp": 37.0}}]}
+        with self._get(legacy):
+            assert driver.get_shaker_temp() == (25.0, 37.0)
+
+    def test_missing_heater_shaker_raises(self):
+        driver = StubFlexHTTPDriver()
+        with self._get({"data": []}), pytest.raises(RuntimeError, match="No heater-shaker"):
+            driver.get_shake_rpm()
+
+    def test_http_error_raises(self):
+        driver = StubFlexHTTPDriver()
+        with self._get({}, status_code=500), pytest.raises(RuntimeError, match="HTTP 500"):
+            driver.get_shake_rpm()
+
+
+class TestMotionFaultLockout:
+    def test_collision_locks_out_further_commands(self):
+        driver = StubFlexHTTPDriver()
+        with pytest.raises(RuntimeError, match="Motion fault"), \
+             patch("AFL.automation.prepare.OT2HTTPDriver.requests.post",
+                   return_value=_JsonResp(_COLLISION_RESPONSE, 201)):
+            OT2HTTPDriver._execute_atomic_command(driver, "moveToWell", {"pipetteId": "p"})
+        assert driver.motion_fault
+
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.post") as post, \
+             pytest.raises(RuntimeError, match="Refusing"):
+            OT2HTTPDriver._execute_atomic_command(driver, "moveToWell", {"pipetteId": "p"})
+        post.assert_not_called()
+
+    def test_move_labware_is_refused_after_fault(self):
+        driver = StubFlexHTTPDriver()
+        driver.motion_fault = "Stall or Collision Detected"
+        with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post") as post, \
+             pytest.raises(RuntimeError, match="Refusing"):
+            driver.move_labware("1", "2")
+        post.assert_not_called()
+
+    def test_home_clears_fault(self):
+        driver = StubFlexHTTPDriver()
+        driver.motion_fault = "Stall or Collision Detected"
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.post",
+                   return_value=_JsonResp({}, 200)):
+            driver.home()
+        assert driver.motion_fault is None
+
+    def test_ordinary_command_failure_does_not_lock(self):
+        driver = StubFlexHTTPDriver()
+        failed = {"data": {"id": "c", "status": "failed",
+                           "error": {"errorCode": "4000", "detail": "bad params"}}}
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.post",
+                   return_value=_JsonResp(failed, 201)), \
+             pytest.raises(RuntimeError, match="Command returned error"):
+            OT2HTTPDriver._execute_atomic_command(driver, "aspirate", {"pipetteId": "p"})
+        assert driver.motion_fault is None
+
+
+class TestCommandPayloads:
+    def test_blowout_uses_api_command_name_and_flow_rate(self):
+        driver = _configured_flex_driver()
+        driver.transfer("1A1", "1A2", 30, blow_out=True)
+        blowouts = [p for c, p in driver.executed_commands if c == "blowout"]
+        assert len(blowouts) == 1
+        assert blowouts[0]["flowRate"] == 300
+        assert "blowOut" not in [c for c, _ in driver.executed_commands]
+
+    def test_mix_sends_flow_rates_and_records_pipette(self):
+        driver = _configured_flex_driver()
+        driver.mix(10, "1A2", repetitions=2)
+        liquid = [(c, p) for c, p in driver.executed_commands if c in ("aspirate", "dispense")]
+        assert len(liquid) == 4
+        assert all("flowRate" in p for _, p in liquid)
+        assert driver.last_pipette == "left"
+
+    def test_align_script_loads_96ch_on_left_mount(self):
+        driver = StubFlexHTTPDriver()
+        assert driver._align_script_mount(_96CH_MOUNT_KEY) == "left"
+        assert driver._align_script_mount("right") == "right"
+
+    def test_nozzle_layouts_match_api_schema(self):
+        driver = StubFlexHTTPDriver()
+        driver.config["loaded_instruments"][_96CH_MOUNT_KEY] = {"pipette_id": "p96", "tip_racks": []}
+        sent = {}
+        for layout in ("full96", "column", "single"):
+            with patch("AFL.automation.prepare.FlexHTTPDriver.requests.post",
+                       return_value=_JsonResp({"data": {"status": "succeeded"}}, 201)) as post:
+                driver.configure_nozzle_layout(layout)
+            sent[layout] = post.call_args.kwargs["json"]["data"]["params"]["configurationParams"]
+        assert sent["full96"] == {"style": "ALL"}
+        assert sent["column"] == {"style": "COLUMN", "primaryNozzle": "A1"}
+        assert sent["single"] == {"style": "SINGLE", "primaryNozzle": "A1"}
+
+
+def test_run_check_timeout_does_not_replace_run():
+    import requests as _requests
+    driver = StubFlexHTTPDriver()
+    with patch("AFL.automation.prepare.OT2HTTPDriver.requests.get",
+               side_effect=_requests.exceptions.Timeout), \
+         patch.object(driver, "_create_run") as create, \
+         pytest.raises(ConnectionError, match="Timed out"):
+        OT2HTTPDriver._ensure_run_exists(driver)
+    create.assert_not_called()
+
+
+def test_virtual_driver_uses_its_own_config_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AFL_HOME", str(tmp_path / "afl"))
+    assert VirtualFlexHTTPDriver().filepath.name == "VirtualFlexHTTPDriver.config.json"
+
+
+class TestRunCreation:
+    def _post_run(self):
+        return patch("AFL.automation.prepare.OT2HTTPDriver.requests.post",
+                     return_value=_JsonResp({"data": {"id": "new-run"}}, 201))
+
+    def test_failed_deck_reload_discards_run_and_raises(self):
+        driver = StubFlexHTTPDriver()
+        with self._post_run(), \
+             patch.object(driver, "_reload_deck_configuration", return_value=False), \
+             patch.object(driver, "_cleanup_stale_run",
+                          side_effect=lambda: setattr(driver, "run_id", None)) as cleanup, \
+             pytest.raises(RuntimeError, match="could not reload the saved deck"):
+            OT2HTTPDriver._create_run(driver)
+        cleanup.assert_called_once()
+        assert driver.run_id is None
+
+    def test_successful_deck_reload_keeps_run(self):
+        driver = StubFlexHTTPDriver()
+        with self._post_run(), \
+             patch.object(driver, "_reload_deck_configuration", return_value=True), \
+             patch.object(driver, "_cleanup_stale_run") as cleanup:
+            assert OT2HTTPDriver._create_run(driver) == "new-run"
+        cleanup.assert_not_called()
+
+
+class TestTipStateSafeguards:
+    def test_new_run_refused_while_tip_attached(self):
+        driver = StubFlexHTTPDriver()
+        driver.has_tip = True
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.post") as post, \
+             pytest.raises(RuntimeError, match="confirm_tip_removed"):
+            OT2HTTPDriver._create_run(driver)
+        post.assert_not_called()
+
+    def test_confirm_tip_removed_clears_tip_state(self):
+        driver = StubFlexHTTPDriver()
+        driver.has_tip = True
+        driver.last_pipette = "left"
+        driver.tip_pipette_id = "flex-left-id"
+        driver.tip_contaminated = True
+        driver.confirm_tip_removed()
+        assert (driver.has_tip, driver.last_pipette,
+                driver.tip_pipette_id, driver.tip_contaminated) == (False, None, None, False)
+
+    def test_reset_tipracks_keeps_attached_tip(self):
+        driver = _configured_flex_driver()
+        driver.has_tip = True
+        driver.reset_tipracks()
+        assert driver.has_tip is True
+
+    def _instruments(self, tip_detected):
+        return _JsonResp({"data": [{
+            "mount": "left", "instrumentType": "pipette",
+            "instrumentName": "p1000_single_flex", "instrumentModel": "p1000_single_v3.6",
+            "serialNumber": "P1K", "data": {"channels": 1, "min_volume": 5.0, "max_volume": 1000.0},
+            "state": {"tipDetected": tip_detected},
+        }]})
+
+    def test_startup_fails_when_tip_sensor_reports_tip(self):
+        driver = StubFlexHTTPDriver()
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.get",
+                   return_value=self._instruments(True)):
+            OT2HTTPDriver._update_pipettes(driver)
+        assert driver.pipette_info["left"]["tip_detected"] is True
+        with pytest.raises(RuntimeError, match="Tip detected on the left pipette"):
+            driver._check_no_tips_attached()
+
+    def test_startup_passes_without_tips(self):
+        driver = StubFlexHTTPDriver()
+        with patch("AFL.automation.prepare.OT2HTTPDriver.requests.get",
+                   return_value=self._instruments(False)):
+            OT2HTTPDriver._update_pipettes(driver)
+        driver._check_no_tips_attached()
+
+    def test_tip_check_runs_before_homing(self):
+        driver = StubFlexHTTPDriver()
+        with patch.object(OT2HTTPDriver, "_initialize_robot"), \
+             patch.object(driver, "_check_no_tips_attached", side_effect=RuntimeError("tip")), \
+             patch.object(driver, "_home_if_needed") as home, \
+             pytest.raises(RuntimeError, match="tip"):
+            driver._initialize_robot()
+        home.assert_not_called()

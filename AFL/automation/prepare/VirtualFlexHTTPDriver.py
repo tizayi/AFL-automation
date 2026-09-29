@@ -15,11 +15,12 @@ This makes it suitable for:
 """
 
 import copy
+import re
 import uuid
 
 from AFL.automation.APIServer.Driver import Driver
 from AFL.automation.prepare.OT2HTTPDriver import TIPRACK_WELLS
-from AFL.automation.prepare.FlexHTTPDriver import FlexHTTPDriver, _96CH_MOUNT_KEY
+from AFL.automation.prepare.FlexHTTPDriver import FlexHTTPDriver, _96CH_MOUNT_KEY, _is_96_channel
 from AFL.automation.shared.utilities import listify
 
 # Deck layout reported by the virtual robot: left/center columns as plain
@@ -55,8 +56,9 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
     """
 
     def __init__(self, overrides=None):
-        super().__init__(overrides=overrides)
-        self.name = "VirtualFlexHTTPDriver"
+        # A separate name keeps the virtual deck state out of the real
+        # FlexHTTPDriver's persistent config file.
+        super().__init__(name="VirtualFlexHTTPDriver", overrides=overrides)
 
     # ------------------------------------------------------------------
     # Bootstrap / robot connection — skip all network calls
@@ -103,9 +105,13 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
     def _pipette_max_volume(self, pipette_name: str) -> int:
         """Extract the maximum volume from a Flex pipette name.
 
-        ``"flex_1channel_1000"`` → ``1000``, ``"flex_8channel_50"`` → ``50``.
-        Falls back to ``1000`` if the name cannot be parsed.
+        ``"p50_single_flex"`` → ``50``, ``"p1000_96"`` → ``1000``, and
+        ``"flex_8channel_50"`` → ``50``.  Falls back to ``1000`` if the name
+        cannot be parsed.
         """
+        match = re.match(r"p(\d+)_", pipette_name)
+        if match:
+            return int(match.group(1))
         parts = pipette_name.rsplit("_", 1)
         try:
             return int(parts[-1])
@@ -113,9 +119,9 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
             return 1000
 
     def _channels_from_name(self, pipette_name: str) -> int:
-        if "96channel" in pipette_name:
+        if _is_96_channel(pipette_name):
             return 96
-        if "8channel" in pipette_name:
+        if "_multi" in pipette_name or "8channel" in pipette_name:
             return 8
         return 1
 
@@ -158,14 +164,15 @@ class VirtualFlexHTTPDriver(FlexHTTPDriver):
     def load_instrument(self, name, mount, tip_rack_slots, reload=False, **kwargs):
         """Register a pipette and initialise its tip supply without contacting the robot.
 
-        Volume limits and channel count are inferred from *name* using the
-        Flex naming convention (``flex_<channels>channel_<volume>``).
+        Volume limits and channel count are inferred from the hardware name
+        *name* normalizes to (``p<volume>_single_flex``, ``p<volume>_multi_flex``,
+        ``p<volume>_96``).
         The 96-channel is always stored under the ``'96channel'`` key regardless
         of what *mount* value is passed in.
         """
         pipette_name = self._normalize_pipette_name(name)
         # 96-channel is always stored under its canonical key.
-        if "96channel" in pipette_name:
+        if _is_96_channel(pipette_name):
             mount = _96CH_MOUNT_KEY
         else:
             mount = str(mount).strip().lower()

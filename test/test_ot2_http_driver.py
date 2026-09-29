@@ -405,7 +405,7 @@ def test_send_labware_reloads_tiprack_and_affected_pipette(monkeypatch, tmp_path
     driver.hardware_pipettes = {
         "left": _pipette_info("left", None, min_volume=20, max_volume=300),
     }
-    driver.has_tip = True
+    driver.has_tip = False
     command_types = []
 
     def fake_post(url, headers=None, params=None, json=None):
@@ -450,8 +450,46 @@ def test_send_labware_reloads_tiprack_and_affected_pipette(monkeypatch, tmp_path
         ("tiprack-new", "A1"),
         ("tiprack-new", "A2"),
     ]
-    assert driver.has_tip is False
-    assert driver.last_pipette is None
+
+
+def test_send_labware_refuses_tiprack_reload_while_tip_attached(monkeypatch, tmp_path):
+    driver = StubOT2HTTPDriver()
+    driver.custom_labware_dir = tmp_path
+    original_tiprack = _custom_labware_def(
+        z_value=6.1, load_name="nist_300ul_tiprack", is_tiprack=True, display_category="tipRack",
+    )
+    updated_tiprack = _custom_labware_def(
+        z_value=6.5, load_name="nist_300ul_tiprack", is_tiprack=True, display_category="tipRack",
+    )
+    driver.sent_custom_labware["custom_beta/nist_300ul_tiprack"] = {
+        "definition_uri": "custom_beta/nist_300ul_tiprack/1",
+        "version": 1,
+        "content_hash": driver._hash_labware_def(original_tiprack),
+    }
+    driver.config["loaded_labware"]["1"] = (
+        "tiprack-old", "nist_300ul_tiprack", {"definition": original_tiprack},
+    )
+    driver.config["loaded_instruments"]["left"] = {
+        "name": "p300_single", "pipette_id": "pipette-old", "tip_racks": ["tiprack-old"],
+    }
+    driver.has_tip = True
+    commands = []
+
+    def fake_post(url, headers=None, params=None, json=None):
+        if url.endswith("/labware_definitions"):
+            return _FakeResponse(
+                {"data": {"definitionUri": "custom_beta/nist_300ul_tiprack/2"}}
+            )
+        commands.append(json["data"]["commandType"])
+        raise AssertionError(f"Unexpected command payload: {json}")
+
+    monkeypatch.setattr("AFL.automation.prepare.OT2HTTPDriver.requests.post", fake_post)
+
+    with pytest.raises(RuntimeError, match="while a tip is attached"):
+        driver.send_labware(updated_tiprack)
+    assert commands == []
+    assert driver.has_tip is True
+    assert driver.config["loaded_labware"]["1"][0] == "tiprack-old"
 
 
 def test_load_labware_uses_resolved_custom_version(monkeypatch, tmp_path):

@@ -36,6 +36,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     }
     # Addressable area used when dropping tips. Subclasses may override.
     TRASH_ADDRESSABLE_AREA = "fixedTrash"
+    # Opentrons error codes after which the robot's position can no longer be
+    # trusted: 2001 motion failed, 2003 stall or collision detected.
+    MOTION_FAULT_ERROR_CODES = {"2001", "2003"}
+    # Description of the last motion fault, or None.  While set, commands are
+    # refused until home() succeeds.
+    motion_fault = None
     defaults = {}
     defaults["robot_ip"] = "127.0.0.1"  # Default to localhost, should be overridden
     defaults["robot_port"] = "31950"  # Default Opentrons HTTP API port
@@ -45,9 +51,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["available_tips"] = {}  # Persistent storage for available tips, Format: {mount: [(tiprack_id, well_name), ...]}
     defaults["prep_targets"] = []  # Persistent storage for prep target well locations
 
-    def __init__(self, overrides=None):
+    def __init__(self, name = "OT2_HTTP_Driver", overrides=None):
         self.app = None
-        self.name = "OT2_HTTP_Driver"
+        self.name = name
         Driver.__init__(
             self,
             name=self.name,
@@ -297,6 +303,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "tiprack_slots": tiprack_slots,
                 }
 
+        # Reloading a pipette gives it a fresh ID that the run believes has no
+        # tip, so refuse (before changing anything) while a tip is attached.
+        if affected_mounts and self.has_tip:
+            raise RuntimeError(
+                f"Cannot reload the tip rack definition for '{namespace}/{load_name}' "
+                "while a tip is attached. Drop the tip (or remove it by hand and call "
+                "confirm_tip_removed()), then retry."
+            )
+
         for slot in matching_slots:
             module_id = None
             if slot in self.config["loaded_modules"]:
@@ -325,15 +340,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             )
             self._remap_tip_availability(mount, old_available_tips, old_uuid_to_slot)
 
-        if affected_mounts:
-            self.has_tip = False
-            self.last_pipette = None
-
     def _initialize_robot(self):
         """Initialize the connection to the robot and get basic information"""
         try:
             # Check if the robot is reachable
-            response = requests.get(url=f"{self.base_url}/health", headers=self.headers)
+            response = requests.get(url=f"{self.base_url}/health", headers=self.headers, timeout=5)
             if response.status_code != 200:
                 raise ConnectionError(f"Failed to connect to robot at {self.base_url}")
 
@@ -357,7 +368,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             # Get basic pipette information
             response = requests.get(
-                url=f"{self.base_url}/instruments", headers=self.headers
+                url=f"{self.base_url}/instruments", headers=self.headers, timeout=5
             )
 
             if response.status_code != 200:
@@ -396,6 +407,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "dispenseFlowRate", {}
                     ).get("value",150),
                     "channels": pipette.get("data",{}).get("channels", 1),
+                    # Flex tip sensor reading; None on the OT-2, which has no sensor.
+                    "tip_detected": pipette.get("state", {}).get("tipDetected"),
                         }
                 if pipette_id is None:
                     continue
@@ -480,6 +493,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 response = requests.get(
                     url=f"{self.base_url}/sessions/{self.session_id}",
                     headers=self.headers,
+                    timeout=5,
                 )
                 if response.status_code == 200:
                     session_data = response.json().get("data", {})
@@ -536,10 +550,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         self.config["available_tips"][m].append((tiprack, well))
                 self.log_info(f"Reset {len(self.config['available_tips'][m])} tips for {m} mount")
 
-        # Reset tip status
-        self.has_tip = False
-
     def reset(self):
+        """Stop the run and clear all deck and tip state.
+
+        The driver then assumes no tip is attached; remove any physical tip by
+        hand before calling this.
+        """
         self.log_info("Resetting the protocol context")
 
         # Stop the current run on the robot before tearing down state.
@@ -551,6 +567,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 requests.delete(
                     url=f"{self.base_url}/sessions/{self.session_id}",
                     headers=self.headers,
+                    timeout=5,
                 )
             except requests.exceptions.RequestException as e:
                 self.log_error(f"Error deleting session: {str(e)}")
@@ -561,6 +578,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 requests.delete(
                     url=f"{self.base_url}/protocols/{self.protocol_id}",
                     headers=self.headers,
+                    timeout=5,
                 )
             except requests.exceptions.RequestException as e:
                 self.log_error(f"Error deleting protocol: {str(e)}")
@@ -577,6 +595,16 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         # Re-initialize robot connection
         self._initialize_robot()
         
+    def confirm_tip_removed(self):
+        """Record that any tip left on a pipette has been removed by hand.
+
+        Call this after the driver refuses to create a run because it believes
+        a tip is still attached.
+        """
+        self.log_info("Operator confirmed that no tip is attached")
+        self.has_tip = False
+        self.last_pipette = None
+
     def reset_deck(self):
         """Reset the deck configuration, clearing loaded labware, instruments, and modules"""
         self.log_info("Resetting the deck configuration")
@@ -620,6 +648,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 raise RuntimeError(f"Failed to home robot: {response.text}")
 
             self.log_info("Robot homing completed successfully")
+            if self.motion_fault is not None:
+                self.log_info("Motion fault cleared by homing")
+                self.motion_fault = None
             return True
 
         except requests.exceptions.RequestException as e:
@@ -693,9 +724,34 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         f"Command returned error : {response.status_code}"
                     )
                     self.log_error(f"Response: {response.text}")
+                    error = response.json()['data'].get('error')
+                    if self._is_motion_fault(error):
+                        self.motion_fault = str(error.get('detail') or error.get('errorType'))
+                        raise RuntimeError(
+                            f"Motion fault ({self.motion_fault}); further commands are "
+                            "refused until the robot is checked and home() is called. "
+                            f"Response: {response.text}"
+                        )
                     raise RuntimeError(
                         f"Command returned error: {response.text}"
                     )
+    def _is_motion_fault(self, error):
+        """Return True if a command *error* (or any error it wraps) is a stall,
+        collision or failed motion."""
+        if not isinstance(error, dict):
+            return False
+        if str(error.get("errorCode")) in self.MOTION_FAULT_ERROR_CODES:
+            return True
+        return any(self._is_motion_fault(e) for e in error.get("wrappedErrors") or [])
+
+    def _require_no_motion_fault(self):
+        """Raise if a stall or collision has occurred since the last home()."""
+        if self.motion_fault is not None:
+            raise RuntimeError(
+                f"Refusing to send commands after a motion fault ({self.motion_fault}). "
+                "Check the deck and the instruments, then call home()."
+            )
+
     def send_labware(
         self, labware_def, check_run_status=True, reload_loaded_labware=True
     ):
@@ -1272,6 +1328,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 check_run_status=False,
             )
             self.has_tip = True
+            self.last_pipette = pipette_mount
 
         # Execute mix by performing repetitions of aspirate/dispense
         for _ in range(repetitions):
@@ -1286,6 +1343,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "origin": "bottom",
                         "offset": {"x": 0, "y": 0, "z": 0},
                     },
+                    "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
                 },
                 check_run_status=False,
             )
@@ -1301,6 +1359,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "origin": "bottom",
                         "offset": {"x": 0, "y": 0, "z": 0},
                     },
+                    "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
                 },
                 check_run_status=False,
             )
@@ -1585,8 +1644,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 self.latch_shaker()
                 
                 # store current shake rpm and stop shake
-                if self.get_shake_rpm()[0] != 'idle':
-                    shake_rpm = self.get_shake_rpm()[2]
+                speed_status, _, target_rpm = self.get_shake_rpm()
+                if speed_status != 'idle' and target_rpm:
+                    shake_rpm = target_rpm
                     was_shaking = True
                     self.stop_shake()
                     
@@ -1790,12 +1850,13 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             # 10. Blow out if specified
             if blow_out:
                 self._execute_atomic_command(
-                    "blowOut",
+                    "blowout",
                     {
                         "pipetteId": pipette_id,
                         "labwareId": dest_well["labwareId"],
                         "wellName": dest_well["wellName"],
                         "wellLocation": {"origin": dest_position, "offset": offset},
+                        "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
                     },
                     check_run_status=False,
                 )
@@ -1870,6 +1931,8 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """
         if params is None:
             params = {}
+
+        self._require_no_motion_fault()
 
         # Track tip usage for pick up and drop commands
         if command_type == "pickUpTip":
@@ -2175,100 +2238,47 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 module_id = module[0]
         return module_id
     
+    def _get_heater_shaker_data(self):
+        """Return the live ``data`` dict of the attached heater-shaker.
+
+        ``GET /modules`` returns ``{"data": [...]}`` for API version 3+ (the
+        Flex) and ``{"modules": [...]}`` for the legacy version the OT-2 uses;
+        both are handled.  Raises RuntimeError if the request fails or no
+        heater-shaker is attached.
+        """
+        response = requests.get(
+            url=f"{self.base_url}/modules", headers=self.headers, timeout=5
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to get modules: HTTP {response.status_code}")
+        body = response.json()
+        modules = body["data"] if isinstance(body.get("data"), list) else body.get("modules", [])
+        for module in modules:
+            if "heaterShaker" in str(module.get("moduleModel", "")):
+                logging.debug(module)
+                return module.get("data", {})
+        raise RuntimeError("No heater-shaker module found")
+
     def get_shaker_temp(self):
+        """Return ``(current_temp, target_temp)``; target is None when not heating."""
         self.log_info("Getting heater-shaker temperature")
-
-        # For get operations, we still need to use the modules API directly
-        try:
-            # Get modules to find the heater-shaker module
-            modules_response = requests.get(
-                url=f"{self.base_url}/modules", headers=self.headers
-            )
-
-            if modules_response.status_code != 200:
-                self.log_error(f"Failed to get modules: {modules_response.status_code}")
-                return f"Error getting modules: {modules_response.status_code}"
-
-            modules = modules_response.json().get("modules", [])
-            heater_shaker_module = next(
-                (m for m in modules if "heaterShaker" in m.get("moduleModel")),
-                None,
-            )
-
-            if not heater_shaker_module:
-                self.log_error("No heater-shaker module found")
-                return "No heater-shaker module found"
-            logging.debug(heater_shaker_module)
-            current_temp = heater_shaker_module.get("data", {}).get("currentTemp")
-            target_temp = heater_shaker_module.get("data", {}).get("targetTemp")
-            self.log_info(
-                    f"Heater-shaker temperature - Current: {current_temp}°C, Target: {target_temp}°C"
-                )
-            return (current_temp,target_temp)
-            
-        except Exception as e:
-            self.log_error(f"Error getting temperature: {str(e)}")
-            return f"Error: {str(e)}"
+        data = self._get_heater_shaker_data()
+        # API v3+ names first, then the legacy OT-2 names.
+        current_temp = data.get("currentTemperature", data.get("currentTemp"))
+        target_temp = data.get("targetTemperature", data.get("targetTemp"))
+        self.log_info(
+            f"Heater-shaker temperature - Current: {current_temp}°C, Target: {target_temp}°C"
+        )
+        return (current_temp, target_temp)
 
     def get_shake_rpm(self):
-        # For get operations, we just use the modules API
-        try:
-            # Get modules to find the heater-shaker module
-            modules_response = requests.get(
-                url=f"{self.base_url}/modules", headers=self.headers
-            )
-
-            if modules_response.status_code != 200:
-                self.log_error(f"Failed to get modules: {modules_response.status_code}")
-                return f"Error getting modules: {modules_response.status_code}"
-
-            modules = modules_response.json().get("modules", [])
-            heater_shaker_module = next(
-                (m for m in modules if "heaterShaker" in m.get("moduleModel")),
-                None,
-            )
-
-            if not heater_shaker_module:
-                self.log_error("No heater-shaker module found")
-                return "No heater-shaker module found"
-
-            current_rpm = heater_shaker_module.get("data", {}).get("currentSpeed")
-            target_rpm = heater_shaker_module.get("data", {}).get("targetSpeed")
-            status = heater_shaker_module.get("data", {}).get("speedStatus")
-            return (status,current_rpm,target_rpm)
-            
-        except Exception as e:
-            self.log_error(f"Error getting RPM: {str(e)}")
-            return f"Error: {str(e)}"
+        """Return ``(speed_status, current_rpm, target_rpm)``; target is None when idle."""
+        data = self._get_heater_shaker_data()
+        return (data.get("speedStatus"), data.get("currentSpeed"), data.get("targetSpeed"))
 
     def get_shake_latch_status(self):
-        # For get operations, we just use the modules API
-        try:
-            # Get modules to find the heater-shaker module
-            modules_response = requests.get(
-                url=f"{self.base_url}/modules", headers=self.headers
-            )
-
-            if modules_response.status_code != 200:
-                self.log_error(f"Failed to get modules: {modules_response.status_code}")
-                return f"Error getting modules: {modules_response.status_code}"
-
-            modules = modules_response.json().get("modules", [])
-            heater_shaker_module = next(
-                (m for m in modules if "heaterShaker" in m.get("moduleModel")),
-                None,
-            )
-
-            if not heater_shaker_module:
-                self.log_error("No heater-shaker module found")
-                return "No heater-shaker module found"
-
-            status = heater_shaker_module.get("data", {}).get("labwareLatchStatus")
-            return status
-            
-        except Exception as e:
-            self.log_error(f"Error getting RPM: {str(e)}")
-            return f"Error: {str(e)}"
+        """Return the labware latch status, e.g. ``"idle_closed"``."""
+        return self._get_heater_shaker_data().get("labwareLatchStatus")
         
     def stop_run(self):
         """Send a stop action for the current run and wait for it to reach a terminal state.
@@ -2351,6 +2361,15 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         """Create a run on the robot for executing commands"""
         self.log_info("Creating a new run for commands")
 
+        # A new run always starts believing no tip is attached, so it could not
+        # use or drop a tip the driver knows is on a pipette.
+        if self.has_tip:
+            raise RuntimeError(
+                "Cannot create a new run while a tip is attached (the new run would "
+                "not know about it). Remove the tip by hand, call confirm_tip_removed(), "
+                "then retry."
+            )
+
         try:
             # Clear custom labware tracking so definitions are re-uploaded for the new run
             self.sent_custom_labware = {}
@@ -2361,6 +2380,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             run_response = requests.post(
                 url=f"{self.base_url}/runs",
                 headers=self.headers,
+                timeout=10,
             )
 
             if run_response.status_code != 201:
@@ -2375,8 +2395,18 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             self._after_run_created(self.run_id)
 
             # Reload previously configured labware, instruments, and modules
-            self._reload_deck_configuration()
-            
+            if not self._reload_deck_configuration():
+                # The new run holds only part of the deck while config still has
+                # the previous run's IDs.  Discard the run so the next command
+                # starts over instead of sending those stale IDs.
+                failed_run_id = self.run_id
+                self._cleanup_stale_run()
+                raise RuntimeError(
+                    f"Created run {failed_run_id} but could not reload the saved deck "
+                    "into it (see the log for the item that failed). Fix the deck or "
+                    "call reset_deck(), then retry."
+                )
+
             return self.run_id
 
         except requests.exceptions.RequestException as e:
@@ -2503,7 +2533,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         # Check if the run is still valid
         try:
             response = requests.get(
-                url=f"{self.base_url}/runs/{self.run_id}", headers=self.headers
+                url=f"{self.base_url}/runs/{self.run_id}", headers=self.headers, timeout=5
             )
 
             if response.status_code != 200:
@@ -2531,6 +2561,12 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
 
             return self.run_id
 
+        except requests.exceptions.Timeout:
+            # The robot is slow or busy; the run may still be valid, so don't
+            # replace it (which would reload the whole deck).
+            raise ConnectionError(
+                f"Timed out checking run {self.run_id} on the robot; retry the command."
+            )
         except requests.exceptions.RequestException:
             # Error checking run, create a new one
             return self._create_run()
@@ -2576,6 +2612,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             "}",
             "",
         ]
+
+    def _align_script_mount(self, mount):
+        """Return the Protocol API mount name for a stored instrument *mount*."""
+        return mount
 
     def make_align_script(self, filename: str):
         """
@@ -2659,7 +2699,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 var_name = f"pipette_{mount}"
                 pipette_vars.append(var_name)
                 
-                script.append(f"{indent}{var_name} = protocol.load_instrument('{name}', '{mount}', tip_racks={tip_racks_arg})")
+                script.append(f"{indent}{var_name} = protocol.load_instrument('{name}', '{self._align_script_mount(mount)}', tip_racks={tip_racks_arg})")
             script.append("")
             
         # 4. Alignment Moves

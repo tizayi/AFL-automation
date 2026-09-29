@@ -56,6 +56,17 @@ _NOZZLE_LAYOUT_CHANNELS = {"full96": 96, "column": 8, "single": 1}
 _96CH_MOUNT_KEY = "96channel"
 
 
+def _is_96_channel(pipette_name):
+    """Return True for a 96-channel pipette name.
+
+    Matches hardware names (``p1000_96``, ``p200_96``) as reported by
+    ``GET /instruments`` and as produced by ``PIPETTE_NAME_ALIASES``, and the
+    Python Protocol API names (``flex_96channel_1000``).
+    """
+    name = str(pipette_name or "")
+    return name.endswith("_96") or "96channel" in name
+
+
 class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     """Driver for the Opentrons Flex (OT-3) robot.
 
@@ -159,11 +170,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         "loaded_gripper": None,
     }
 
-    def __init__(self, overrides=None):
+    def __init__(self, name="FlexHTTPDriver", overrides=None):
         # _initialize_robot() (called inside OT2HTTPDriver.__init__) switches
         # the headers to the Flex API version before its first request.
-        OT2HTTPDriver.__init__(self, overrides=overrides)
-        self.name = "FlexHTTPDriver"
+        OT2HTTPDriver.__init__(self, name=name, overrides=overrides)
         self.headers = {"Opentrons-Version": self.API_VERSION}
 
     def load_labware(self, name, slot, module=None, check_run_status=True, **kwargs):
@@ -189,8 +199,25 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         # here before any requests go out.
         self.headers = {"Opentrons-Version": self.API_VERSION}
         super()._initialize_robot()
+        self._check_no_tips_attached()
         self._home_if_needed()
         self._autodetect_trash_area()
+
+    def _check_no_tips_attached(self):
+        """Refuse to start while a pipette's tip sensor reports a tip.
+
+        The driver starts believing no tip is attached, so a tip left on (e.g.
+        after a crash) would be driven into the tip rack at the next pickup.
+        """
+        mounts = [
+            mount for mount, info in self.pipette_info.items()
+            if info and info.get("tip_detected")
+        ]
+        if mounts:
+            raise RuntimeError(
+                f"Tip detected on the {', '.join(mounts)} pipette. Remove it by hand, "
+                "then restart the driver."
+            )
 
     def _home_if_needed(self):
         """Home the robot if any gantry axis is not engaged (i.e. after power-on or E-stop).
@@ -202,6 +229,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             response = requests.get(
                 url=f"{self.base_url}/motors/engaged",
                 headers=self.headers,
+                timeout=5,
             )
             if response.status_code != 200:
                 self.log_warning(
@@ -383,7 +411,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         """Return the number of active nozzles on the pipette with *pipette_id*."""
         for mount, info in self.pipette_info.items():
             if info and info.get("id") == pipette_id:
-                if mount == _96CH_MOUNT_KEY or "96channel" in str(info.get("name", "")):
+                if mount == _96CH_MOUNT_KEY or _is_96_channel(info.get("name")):
                     layout = (
                         self.config.get("loaded_instruments", {})
                         .get(_96CH_MOUNT_KEY, {})
@@ -501,6 +529,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         instr_response = requests.get(
             url=f"{self.base_url}/instruments",
             headers=self.headers,
+            timeout=5,
         )
         if instr_response.status_code != 200:
             raise RuntimeError(
@@ -579,6 +608,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             or *dest_slot* is ``"wasteChute"`` without the gripper or without
             an uncovered waste chute.
         """
+        self._require_no_motion_fault()
         source_slot, new_location, dest_label, strategy = self._plan_labware_move(
             source_slot, dest_slot, use_gripper
         )
@@ -673,6 +703,10 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             if labware_id in racks:
                 instrument["tip_racks"] = [r for r in racks if r != labware_id]
 
+    def _align_script_mount(self, mount):
+        """The Protocol API loads the 96-channel on the ``'left'`` mount."""
+        return "left" if mount == _96CH_MOUNT_KEY else mount
+
     def _align_script_header(self):
         """Alignment-script header declaring a Flex protocol.
 
@@ -704,7 +738,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         # it so we can distinguish it from an independent left-mount 1-channel.
         if "left" in self.pipette_info:
             info = self.pipette_info["left"]
-            if info and "96channel" in info.get("name", ""):
+            if info and _is_96_channel(info.get("name")):
                 self.pipette_info[_96CH_MOUNT_KEY] = self.pipette_info.pop("left")
 
         # Recover the run-scoped pipette ID that OT2HTTPDriver._update_pipettes
@@ -714,6 +748,12 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             stored_id = stored.get("pipette_id")
             if stored_id and not self.pipette_info[_96CH_MOUNT_KEY].get("id"):
                 self.pipette_info[_96CH_MOUNT_KEY]["id"] = stored_id
+
+    def confirm_tip_removed(self):
+        """Record that any tip was removed by hand, including one marked for discard."""
+        super().confirm_tip_removed()
+        self.tip_pipette_id = None
+        self.tip_contaminated = False
 
     def reset_deck(self):
         """Reset deck state, clear the gripper, and forget any attached tip.
@@ -739,8 +779,7 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         :meth:`OT2HTTPDriver.load_instrument`.
         """
         pipette_name = self._normalize_pipette_name(name)
-        print(pipette_name)
-        if "96channel" not in pipette_name:
+        if not _is_96_channel(pipette_name):
             return super().load_instrument(name, mount, tip_rack_slots, reload=reload, **kwargs)
 
         # Suppress the OT2 'left'/'right' validation by passing mount='left'.
@@ -801,9 +840,9 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
             ``"single"``  — 1 nozzle only (behaves like 1-channel).
         """
         _layout_params = {
-            "full96":  {"primaryNozzle": "A1", "frontRightNozzle": "H12", "style": "ALL"},
-            "column":  {"primaryNozzle": "A1", "frontRightNozzle": "H1",  "style": "COLUMN"},
-            "single":  {"primaryNozzle": "A1", "frontRightNozzle": "A1",  "style": "SINGLE"},
+            "full96":  {"style": "ALL"},
+            "column":  {"style": "COLUMN", "primaryNozzle": "A1"},
+            "single":  {"style": "SINGLE", "primaryNozzle": "A1"},
         }
         if config_type not in _layout_params:
             raise ValueError(
