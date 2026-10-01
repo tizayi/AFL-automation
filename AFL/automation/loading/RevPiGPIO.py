@@ -18,7 +18,9 @@ class RevPiGPIO:
         ``{'I_1': 'DOOR', 'I_2': 'ARM_UP'}``.
     autorefresh : bool, optional
         Passed to ``revpimodio2.RevPiModIO``. Defaults to ``True`` so reads
-        reflect the current process image.
+        reflect the current process image. The process image is always
+        opened in monitoring (read-only) mode so outputs are left to
+        :class:`RevPiRelay`.
     """
 
     def __init__(self, channels: dict, autorefresh: bool = True) -> None:
@@ -27,7 +29,12 @@ class RevPiGPIO:
         )
         self.channels = dict(channels)
         self.ids = {name: pictory_name for pictory_name, name in self.channels.items()}
-        self._rpi = self.revpimodio.RevPiModIO(autorefresh=autorefresh)
+        # monitoring=True: never write outputs. Otherwise this instance would
+        # write its own (all False) output buffer every autorefresh cycle and
+        # fight RevPiRelay's instance, rapidly toggling the valves.
+        self._rpi = self.revpimodio.RevPiModIO(
+            autorefresh=autorefresh, monitoring=True
+        )
 
         for pictory_name in self.channels:
             try:

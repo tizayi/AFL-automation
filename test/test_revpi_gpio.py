@@ -6,8 +6,9 @@ from AFL.automation.loading.RevPiGPIO import RevPiGPIO
 
 
 class FakeRevPiModIO:
-    def __init__(self, autorefresh):
+    def __init__(self, autorefresh, monitoring=False):
         self.autorefresh = autorefresh
+        self.monitoring = monitoring
         self.io = {
             "I_1": SimpleNamespace(value=1),
             "I_2": SimpleNamespace(value=0),
@@ -30,6 +31,14 @@ def test_revpi_gpio_reads_current_process_image(monkeypatch):
 
     gpio._rpi.io["I_2"].value = 1
     assert gpio.read("ARM_UP") is True
+
+
+def test_revpi_gpio_opens_process_image_read_only(monkeypatch):
+    # A second autorefreshing RevPiModIO that is not in monitoring mode writes
+    # its (all False) output buffer every cycle, fighting RevPiRelay.
+    gpio = make_gpio(monkeypatch)
+
+    assert gpio._rpi.monitoring is True
 
 
 def test_revpi_gpio_validates_input_names(monkeypatch):
