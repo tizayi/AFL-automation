@@ -1,4 +1,4 @@
-import os,sys,subprocess,importlib
+import os,sys,subprocess,importlib,copy
 import argparse
 from pathlib import Path
 try:
@@ -151,7 +151,7 @@ args = parser.parse_args()
 
 if main_module_name in AFL_GLOBAL_CONFIG['driver_custom_configs']:
         print(f'launching from custom config for {main_module_name}')
-        driver = _reconstitute_objects(AFL_GLOBAL_CONFIG['driver_custom_configs'][main_module_name],data=data)
+        driver = _reconstitute_objects(copy.deepcopy(AFL_GLOBAL_CONFIG['driver_custom_configs'][main_module_name]),data=data)
 else:
         driver = driver_cls()
 server = APIServer(main_module_name,data=data,contact=AFL_GLOBAL_CONFIG['owner_email'])
