@@ -243,7 +243,7 @@ class Server {
     executeQuickbarTask(task) { 
 
       var address = this.address + 'enqueue';
-      var params = $(`.${task.replaceAll(' ','_').toLowerCase()}_params`).toArray()
+      var params = $(`.${quickbarParamsClass(this.key, task)}`).toArray()
 
       var python_param, python_type,value;
 
@@ -345,6 +345,15 @@ class Server {
  *Helper function for extracting values from 
  *input text fields
  */
+
+/**
+ * CSS class for a quickbar function's inputs. Includes the server key so that
+ * servers with same-named functions (e.g. two robots' Transfer) don't collect
+ * each other's inputs.
+ */
+function quickbarParamsClass(serverKey, functionName){
+  return `${serverKey}_${functionName.replaceAll(' ','_').toLowerCase()}_params`
+}
 
 function getInputValue(input){
   var value;

@@ -37,7 +37,6 @@ class LabJackDigitalOut():# xxx todo: generic digitalout class?Sensor):
     #def __del__(self):
         
     def write(self,val):
-        numSkippedIntervals = self.ljm.waitForNextInterval(self.intervalHandle)
         #if self.intermittent_device_handle:
         #    self.device_handle = ljm.openS(self.devicetype, self.connection, self.deviceident)
         result = self.ljm.eWriteName(self.device_handle, self.port_to_write,val)

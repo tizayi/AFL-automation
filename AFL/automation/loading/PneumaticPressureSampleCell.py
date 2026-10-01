@@ -27,6 +27,12 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
     defaults['load_timeout'] = 60
     
     defaults['arm_move_delay'] = 0.2
+    defaults['arm_limit_timeout'] = 10
+    # Destination labels used when loadSample/advanceSample get none (e.g. from
+    # the web quickbar). Only load stoppers whose sensorlabel appears in the
+    # label, or whose sensorlabel is empty, can stop that load.
+    defaults['load_dest_label'] = ''
+    defaults['advance_dest_label'] = ''
     defaults['vent_delay'] = 0.5
     defaults['rinse_program'] = [
                                 ('rinse1',5),
@@ -60,6 +66,16 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
                 e.g. selector = SainSmartRelay(port,portlabels={'catch':1,'cell':2,'rinse':3,'waste':4,'air':5})
 
         '''
+        # Fail before touching any outputs: an unreachable door host is
+        # treated as "door open" and would block the arm forever.
+        if robot_interlock_host and ('<' in robot_interlock_host or '>' in robot_interlock_host):
+            raise ValueError(
+                f'robot_interlock_host is still the placeholder {robot_interlock_host!r}. '
+                'Set it to the robot IP/hostname, or None to disable the door interlock, '
+                'in the stored driver config (the launcher only copies '
+                '_DEFAULT_CUSTOM_CONFIG on first run).'
+            )
+
         self._app = None
         Driver.__init__(self,name='PneumaticSampleCell',defaults=self.gather_defaults(),overrides=overrides)
         self.pctrl = pctrl
@@ -191,7 +207,7 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
 
         try:
             state = requests.get(self.robot_interlock_url,headers = {
-        'Opentrons-Version': '2'}).json()['data']['status']
+        'Opentrons-Version': '2'},timeout=2).json()['data']['status']
         except Exception:
             return True
         if state == 'open':
@@ -202,12 +218,24 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
             raise ValueError('could not get robot door status')
 
 
+    def _wait_for_arm_limit(self,limit,valve):
+        '''Wait for a limit switch input to go False (reached); on timeout turn the valve off and raise.'''
+        deadline = time.monotonic() + self.config['arm_limit_timeout']
+        while self.digitalin.state[limit]:
+            if time.monotonic() > deadline:
+                self.relayboard.setChannels({valve:False})
+                self.arm_state = 'UNKNOWN'
+                raise RuntimeError(
+                    f"Arm did not reach {limit} within {self.config['arm_limit_timeout']} s; "
+                    f"turned '{valve}' off. Check air supply and the {limit} switch wiring/polarity."
+                )
+            time.sleep(0.1)
+
     def _arm_up(self):
         self._arm_interlock_check()
         self.relayboard.setChannels({'piston-vent':True,'arm-up':True,'arm-down':False})
         if self._USE_ARM_LIMITS:
-            while self.digitalin.state['ARM_UP']:
-                time.sleep(0.1)
+            self._wait_for_arm_limit('ARM_UP','arm-up')
         else:
             time.sleep(self.config['arm_move_delay'])
         self.arm_state = 'UP'
@@ -217,20 +245,22 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
         self.relayboard.setChannels({'piston-vent':True,'arm-up':False,'arm-down':True})
         time.sleep(self.config['arm_move_delay'])
         if self._USE_ARM_LIMITS:
-            while self.digitalin.state['ARM_DOWN']:
-                time.sleep(0.1)
+            self._wait_for_arm_limit('ARM_DOWN','arm-down')
         else:
             time.sleep(self.config['arm_move_delay'])
         self.arm_state = 'DOWN'
 
     @Driver.quickbar(qb={'button_text':'Load Sample',
         'params':{'sampleVolume':{'label':'Sample Volume (mL)','type':'float','default':0.3}}})
-    def loadSample(self,cellname='cell',sampleVolume=None,load_dest_label=''):
+    def loadSample(self,cellname='cell',sampleVolume=None,load_dest_label=None):
         '''
         Load a sample into the cell
-        
+
         Params `cellname` and `sampleVolume` are kept for backward compat, but are deprecated and unused.
+        load_dest_label defaults to config['load_dest_label']; see advanceSample for its meaning.
         '''
+        if load_dest_label is None:
+            load_dest_label = self.config['load_dest_label']
         
         if self.state != 'READY':
             raise Exception('Tried to load sample but cell not READY.')
@@ -260,9 +290,8 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
         self.relayboard.setChannels({'postsample':False})
         self.state = 'LOADED'
         time.sleep(1) # crude hack to allow sensor to push data into packet
-    @Driver.quickbar(qb={'button_text':'Advance Sample',
-        'params':{'sampleVolume':{'label':'Sample Volume (mL)','type':'float','default':0.3}}})
-    def advanceSample(self,load_dest_label=''):
+    @Driver.quickbar(qb={'button_text':'Advance Sample'})
+    def advanceSample(self,load_dest_label=None):
         '''
         Move a sample from one measurement cell to the next
         
@@ -277,7 +306,10 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
                     advanceSample(load_dest_label='afterSANS') --> sensor 1 or sensor 3 can stop it
                     advanceSample(load_dest_label='beforeSPEC afterSANS') --> sensor 1, sensor 2, or sensor 3 can stop it
                     advanceSample(load_dest_label='') --> only sensor 3 can stop it
+                defaults to config['advance_dest_label'].
         '''
+        if load_dest_label is None:
+            load_dest_label = self.config['advance_dest_label']
         
         if self.state != 'LOADED':
             raise Exception('Tried to advance sample but no sample is loaded.')
@@ -409,15 +441,11 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
                 out.append(list(np.transpose(ls.poll.read_load_buffer())))
             return out
     
-    def set_sensor_config(self,**kwargs):
-        if self.load_stopper is not None:
-            if 'sensor_n' in kwargs:
-                self.load_stopper[kwargs[sensor_n]].update(kwargs)
-                self.load_stopper[kwargs[sensor_n]].reset()                        
-            else: # assume it should apply to all
-                for ls in self.load_stopper:
-                    ls.config.update(kwargs)
-                    ls.reset()
+    def set_sensor_config(self,sensor_n=None,**kwargs):
+        '''Update load stopper config for sensor `sensor_n`, or all sensors if None, and restart it.'''
+        for ls in self._select_load_stoppers(sensor_n):
+            ls.config.update(kwargs)
+            ls.reset()
 
     def get_sensor_config(self,**kwargs):
         if self.load_stopper is not None:
@@ -429,30 +457,16 @@ class PneumaticPressureSampleCell(Driver,SampleCell):
     @Driver.unqueued()
     @Driver.quickbar(qb={'button_text':'Reset Sensor', 'params':{}})
     def sensor_reset(self,sensor_n = None):
-        if self.load_stopper is not None:
-            if sensor_n is not None:
-                self.load_stopper[sensor_n].reset_poll()
-                self.load_stopper[sensor_n].reset_stopper()
-                if self.load_stopper[sensor_n]._app is not None:
-                    self.load_stopper[sensor_n].poll.app = self._app
-                    self.load_stopper[sensor_n].stopper.app = self._app
-                if self.load_stopper[sensor_n]._data is not None:
-                    self.load_stopper[sensor_n].poll.data = self._data
-                    self.load_stopper[sensor_n].stopper.data = self._data
-                self.load_stopper[sensor_n].poll.start()
-                self.load_stopper[sensor_n].stopper.start()
-            else:
-                for ls in self.load_stopper:
-                    ls.reset_poll()
-                    ls.reset_stopper()
-                    if ls_app is not None:
-                        ls.poll.app = self._app
-                        ls.stopper.app = self._app
-                    if ls._data is not None:
-                        ls.poll.data = self._data
-                        ls.stopper.data = self._data
-                    ls.poll.start()
-                    ls.stopper.start()
+        '''Restart polling and stop-detection for sensor `sensor_n`, or all sensors if None.'''
+        for ls in self._select_load_stoppers(sensor_n):
+            ls.reset()
+
+    def _select_load_stoppers(self,sensor_n=None):
+        if self.load_stopper is None:
+            return []
+        if sensor_n is None:
+            return list(self.load_stopper)
+        return [self.load_stopper[int(sensor_n)]]
 
 
 

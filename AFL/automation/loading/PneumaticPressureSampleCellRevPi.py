@@ -13,6 +13,20 @@ from AFL.automation.loading.PneumaticPressureSampleCell import (
 class PneumaticPressureSampleCellRevPi(PneumaticPressureSampleCell):
     """Pneumatic pressure sample cell configured for RevPi digital I/O."""
 
+    # Load up to the sensor before the beam, then advance to the one after it.
+    defaults = {
+        'load_dest_label': 'beforeTarget',
+        'advance_dest_label': 'afterTarget',
+    }
+
+    @classmethod
+    def gather_defaults(cls):
+        # Driver.gather_defaults lets parent classes win on shared keys, so
+        # apply this class's overrides last.
+        defaults = super().gather_defaults()
+        defaults.update(cls.defaults)
+        return defaults
+
 
 _DEFAULT_CUSTOM_CONFIG = {
     '_classname': (

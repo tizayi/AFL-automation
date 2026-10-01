@@ -45,6 +45,8 @@ Note on output naming:
 """
 
 import atexit
+import os
+import signal
 import threading
 import time
 import warnings
@@ -85,7 +87,10 @@ class RevPiRelay(MultiChannelRelay):
         # Software-side state mirror: {logical_name: bool}
         self.state = {name: False for name in self.ids}
 
-        self._lock = threading.Lock()
+        # Re-entrant: a signal handler may call shutdown() on the main thread
+        # while that thread is already inside setChannels().
+        self._lock = threading.RLock()
+        self._closed = False
         self._rpi = self.revpimodio.RevPiModIO(autorefresh=autorefresh)
 
         # Validate that every piCtory name actually exists in the process image.
@@ -98,7 +103,8 @@ class RevPiRelay(MultiChannelRelay):
                     f"process image.  Check your piCtory configuration."
                 )
 
-        atexit.register(self.setAllChannelsOff)
+        atexit.register(self.shutdown)
+        self._install_signal_handlers()
 
     # ------------------------------------------------------------------
     # Public interface (MultiChannelRelay)
@@ -107,6 +113,25 @@ class RevPiRelay(MultiChannelRelay):
     def setAllChannelsOff(self):
         """Set every configured output to False (relay open / de-energised)."""
         self.setChannels({name: False for name in self.ids})
+
+    def shutdown(self) -> None:
+        """De-energise every output, write it to the hardware and stop I/O.
+
+        The RevPi holds its outputs after the process ends, so this must run
+        before exit or the valves stay on. ``RevPiModIO.exit`` stops
+        autorefresh and writes the output buffer one final time; a plain
+        ``writeprocimg`` would silently skip devices still in autorefresh.
+        Safe to call more than once.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            for name in self.state:
+                self.state[name] = False
+                self._rpi.io[self.ids[name]].value = False
+            self._closed = True
+            self._rpi.exit(full=True)
+            print('RevPiRelay: all outputs off, RevPi I/O closed.')
 
     def setChannels(self, channels: dict[str,bool]):
         """Set one or more relay outputs.
@@ -121,6 +146,10 @@ class RevPiRelay(MultiChannelRelay):
         print(f'RevPiRelay state change, CHANNELS = {channels}')
 
         with self._lock:
+            if self._closed:
+                raise RuntimeError(
+                    "RevPiRelay: cannot set channels, relay has been shut down."
+                )
             for name, val in channels.items():
                 if name not in self.ids:
                     raise KeyError(
@@ -164,6 +193,34 @@ class RevPiRelay(MultiChannelRelay):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _install_signal_handlers(self) -> None:
+        """Turn outputs off on SIGTERM/SIGINT, then defer to the prior handler.
+
+        ``atexit`` does not run when the process is killed by SIGTERM (e.g.
+        ``systemctl stop``). ``RevPiModIO.handlesignalend`` is not used
+        because it swallows the signal and leaves the server running.
+        """
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous = signal.getsignal(signum)
+
+            def handler(signum, frame, previous=previous):
+                self.shutdown()
+                if callable(previous):
+                    previous(signum, frame)
+                elif previous == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+
+            try:
+                signal.signal(signum, handler)
+            except ValueError:
+                # Only the main thread may install signal handlers.
+                warnings.warn(
+                    "RevPiRelay: not created on the main thread; outputs will "
+                    "not be turned off on SIGTERM/SIGINT."
+                )
+                return
 
     def _refresh_board_state(self) -> None:
         """Write the current software state to the RevPi process image and verify readback.

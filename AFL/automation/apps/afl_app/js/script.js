@@ -58,7 +58,7 @@ function addServerToMenu(server) {
         commands += '<div class="quickbar_group">'
         button_text = result[function_name]['qb']['button_text'];
         params = result[function_name]['qb']['params'];
-        params_class = `${function_name.replaceAll(' ','_').toLowerCase()}_params`
+        params_class = quickbarParamsClass(server.key, function_name)
 
         for(let field_name in params) {
           label = params[field_name]['label']
@@ -79,6 +79,7 @@ function addServerToMenu(server) {
           } else if(python_type=='bool'){
             commands += `<input `
             commands += `type="checkbox" `
+            if(default_value){ commands += `checked `}
             commands += `python_param="${field_name}" `
             commands += `python_type="${python_type}" `
             commands += `name="${label}" `

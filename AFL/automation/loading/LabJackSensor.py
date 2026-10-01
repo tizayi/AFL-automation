@@ -1,3 +1,5 @@
+import itertools
+
 import lazy_loader as lazy
 
 from AFL.automation.loading.Sensor import Sensor
@@ -6,6 +8,10 @@ import time
 
 
 class LabJackSensor(Sensor):
+    # LJM interval timers are global per process; each sensor polls on its own
+    # thread, so each needs its own handle or they steal each other's ticks.
+    _interval_handles = itertools.count(1)
+
     def __init__(self,devicetype="ANY",connection="ANY",deviceident="ANY",port_to_read="AIN0",reset_port="DIO5",polling_rate=200,intermittent_device_handle=False):
         '''
     	Initialize a LabJack connection
@@ -26,7 +32,7 @@ class LabJackSensor(Sensor):
         self.devicetype = devicetype
         self.connection = connection
         self.deviceident = deviceident
-        self.intervalHandle = 0
+        self.intervalHandle = next(LabJackSensor._interval_handles)
         self.intermittent_device_handle = intermittent_device_handle
         self.ljm.startInterval(self.intervalHandle, polling_rate)
         self.ljm.eWriteName(self.device_handle,self.fio,1)#set physical FIO6 / logical DIO6 to TTL-hi
