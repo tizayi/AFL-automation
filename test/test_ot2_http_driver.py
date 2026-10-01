@@ -187,10 +187,59 @@ def test_set_flow_rates_updates_only_loaded_pipettes():
     driver.set_aspirate_rate(111)
     driver.set_dispense_rate(222)
 
-    assert driver.pipette_info["left"]["aspirate_flow_rate"] == 111
-    assert driver.pipette_info["left"]["dispense_flow_rate"] == 222
-    assert driver.pipette_info["right"]["aspirate_flow_rate"] == 150
-    assert driver.pipette_info["right"]["dispense_flow_rate"] == 300
+    assert driver.get_aspirate_rate("left") == 111
+    assert driver.get_dispense_rate("left") == 222
+    # The right pipette is attached but not loaded, so it keeps its defaults.
+    assert "right" not in driver.config["flow_rates"]
+    assert driver._flow_rate("right", "aspirate") == 150
+    assert driver._flow_rate("right", "dispense") == 300
+
+
+def test_set_flow_rates_survive_pipette_refresh():
+    driver = _configured_driver()
+    driver.set_aspirate_rate(111)
+    driver._update_pipettes()  # get_pipette() does this before every transfer
+    assert driver.get_aspirate_rate("left") == 111
+
+
+def _flow_rates_sent(driver, command):
+    return [params["flowRate"] for name, params in driver.executed_commands if name == command]
+
+
+def test_transfer_rates_are_sent_and_kept_like_ot2_driver():
+    driver = _configured_driver()
+
+    driver.transfer("1A1", "1A2", 50, aspirate_rate=111, dispense_rate=222)
+    assert _flow_rates_sent(driver, "aspirate") == [111]
+    assert _flow_rates_sent(driver, "dispense") == [222]
+
+    # As in OT2_Driver, rates passed to transfer() stay set for later transfers.
+    driver.executed_commands.clear()
+    driver.transfer("1A1", "1A2", 50)
+    assert _flow_rates_sent(driver, "aspirate") == [111]
+    assert _flow_rates_sent(driver, "dispense") == [222]
+
+
+def test_mix_rates_apply_to_the_mix_only():
+    driver = _configured_driver()
+    driver.set_aspirate_rate(100)
+    driver.set_dispense_rate(200)
+
+    driver.transfer("1A1", "1A2", 50, mix_before=(1, 20), mix_after=(1, 20),
+                    mix_aspirate_rate=10, mix_dispense_rate=20)
+
+    # mix-before aspirate, transfer aspirate, mix-after aspirate
+    assert _flow_rates_sent(driver, "aspirate") == [10, 100, 10]
+    assert _flow_rates_sent(driver, "dispense") == [20, 200, 20]
+    assert driver.get_aspirate_rate("left") == 100
+    assert driver.get_dispense_rate("left") == 200
+
+
+def test_loading_a_new_pipette_resets_its_rates():
+    driver = _configured_driver()
+    driver.set_aspirate_rate(111)
+    driver._forget_flow_rates("left")
+    assert driver.get_aspirate_rate("left") == 150
 
 
 def test_get_pipette_ignores_attached_but_unloaded_mount():

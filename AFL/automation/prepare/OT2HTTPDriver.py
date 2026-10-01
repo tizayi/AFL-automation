@@ -50,6 +50,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
     defaults["loaded_modules"] = {}  # Persistent storage for loaded modules
     defaults["available_tips"] = {}  # Persistent storage for available tips, Format: {mount: [(tiprack_id, well_name), ...]}
     defaults["prep_targets"] = []  # Persistent storage for prep target well locations
+    defaults["flow_rates"] = {}  # Rates set by the user, Format: {mount: {"aspirate": uL/s, "dispense": uL/s}}
 
     def __init__(self, name = "OT2_HTTP_Driver", overrides=None):
         self.app = None
@@ -615,6 +616,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         self.config["loaded_modules"] = {}
         self.config["available_tips"] = {}
         self.config["prep_targets"] = []
+        self.config["flow_rates"] = {}
         
         # Clear internal state variables
         self.modules = {}
@@ -1176,8 +1178,9 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                 "tip_racks": tip_racks,
             }
 
-            # If not reloading, initialize available tips for this mount
+            # If not reloading, initialize available tips (and default flow rates) for this mount
             if not reload:
+                self._forget_flow_rates(mount)
                 self.config["available_tips"][mount] = []
                 for tiprack in tip_racks:
                     for well in TIPRACK_WELLS:
@@ -1343,7 +1346,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "origin": "bottom",
                         "offset": {"x": 0, "y": 0, "z": 0},
                     },
-                    "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
+                    "flowRate": self._flow_rate(pipette_mount, "aspirate"),
                 },
                 check_run_status=False,
             )
@@ -1359,7 +1362,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "origin": "bottom",
                         "offset": {"x": 0, "y": 0, "z": 0},
                     },
-                    "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
+                    "flowRate": self._flow_rate(pipette_mount, "dispense"),
                 },
                 check_run_status=False,
             )
@@ -1654,13 +1657,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             if mix_before is not None:
                 n_mixes, mix_volume = mix_before
 
-                # Set mix aspirate rate if specified
-                if mix_aspirate_rate is not None:
-                    self.set_aspirate_rate(mix_aspirate_rate, pipette_mount)
-
-                # Set mix dispense rate if specified
-                if mix_dispense_rate is not None:
-                    self.set_dispense_rate(mix_dispense_rate, pipette_mount)
+                # Mix rates apply to this mix only; the pipette's rates are unchanged.
+                mix_asp_rate = (mix_aspirate_rate if mix_aspirate_rate is not None
+                                else self._flow_rate(pipette_mount, "aspirate"))
+                mix_disp_rate = (mix_dispense_rate if mix_dispense_rate is not None
+                                 else self._flow_rate(pipette_mount, "dispense"))
 
                 # Mix before transfer - implement by executing multiple aspirate/dispense
                 for _ in range(n_mixes):
@@ -1675,7 +1676,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                                 "origin": source_position,
                                 "offset": {"x": 0, "y": 0, "z": 0},
                             },
-                            "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
+                            "flowRate": mix_asp_rate,
                         },
                         check_run_status=False,
                     )
@@ -1691,18 +1692,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                                 "origin": source_position,
                                 "offset": {"x": 0, "y": 0, "z": 0},
                             },
-                            "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
+                            "flowRate": mix_disp_rate,
                         },
                         check_run_status=False,
                     )
-
-                # Restore original rates
-                if mix_aspirate_rate is not None or mix_dispense_rate is not None:
-                    # Reset rates to default or specified rates
-                    if aspirate_rate is not None:
-                        self.set_aspirate_rate(aspirate_rate, pipette_mount)
-                    if dispense_rate is not None:
-                        self.set_dispense_rate(dispense_rate, pipette_mount)
 
             # 3. Aspirate
             self._execute_atomic_command(
@@ -1716,7 +1709,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "origin": source_position,
                         "offset": {"x": 0, "y": 0, "z": 0},
                     },
-                    "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
+                    "flowRate": self._flow_rate(pipette_mount, "aspirate"),
                 },
                 check_run_status=False,
             )
@@ -1758,7 +1751,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                             "origin": "top",
                             "offset": {"x": 0, "y": 0, "z": 0},
                         },
-                        "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
+                        "flowRate": self._flow_rate(pipette_mount, "aspirate"),
                     },
                     check_run_status=False,
                 )
@@ -1783,7 +1776,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                     "labwareId": dest_well["labwareId"],
                     "wellName": dest_well["wellName"],
                     "wellLocation": {"origin": dest_position, "offset": offset},
-                    "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
+                    "flowRate": self._flow_rate(pipette_mount, "dispense"),
                 },
                 check_run_status=False,
             )
@@ -1797,13 +1790,11 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             if mix_after is not None:
                 n_mixes, mix_volume = mix_after
 
-                # Set mix aspirate rate if specified
-                if mix_aspirate_rate is not None:
-                    self.set_aspirate_rate(mix_aspirate_rate, pipette_mount)
-
-                # Set mix dispense rate if specified
-                if mix_dispense_rate is not None:
-                    self.set_dispense_rate(mix_dispense_rate, pipette_mount)
+                # Mix rates apply to this mix only; the pipette's rates are unchanged.
+                mix_asp_rate = (mix_aspirate_rate if mix_aspirate_rate is not None
+                                else self._flow_rate(pipette_mount, "aspirate"))
+                mix_disp_rate = (mix_dispense_rate if mix_dispense_rate is not None
+                                 else self._flow_rate(pipette_mount, "dispense"))
 
                 # Mix after transfer should be performed from the bottom of the destination well
                 mix_well_location = {
@@ -1821,7 +1812,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                             "labwareId": dest_well["labwareId"],
                             "wellName": dest_well["wellName"],
                             "wellLocation": mix_well_location,
-                            "flowRate": self.pipette_info[pipette_mount]['aspirate_flow_rate'],
+                            "flowRate": mix_asp_rate,
                         },
                         check_run_status=False,
                     )
@@ -1834,18 +1825,10 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                             "labwareId": dest_well["labwareId"],
                             "wellName": dest_well["wellName"],
                             "wellLocation": mix_well_location,
-                            "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
+                            "flowRate": mix_disp_rate,
                         },
                         check_run_status=False,
                     )
-
-                # Restore original rates
-                if mix_aspirate_rate is not None or mix_dispense_rate is not None:
-                    # Reset rates to default or specified rates
-                    if aspirate_rate is not None:
-                        self.set_aspirate_rate(aspirate_rate, pipette_mount)
-                    if dispense_rate is not None:
-                        self.set_dispense_rate(dispense_rate, pipette_mount)
 
             # 10. Blow out if specified
             if blow_out:
@@ -1856,7 +1839,7 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
                         "labwareId": dest_well["labwareId"],
                         "wellName": dest_well["wellName"],
                         "wellLocation": {"origin": dest_position, "offset": offset},
-                        "flowRate": self.pipette_info[pipette_mount]['dispense_flow_rate'],
+                        "flowRate": self._flow_rate(pipette_mount, "blow_out"),
                     },
                     check_run_status=False,
                 )
@@ -2015,34 +1998,61 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
             raise RuntimeError(f"Error executing command: {str(e)}")
 
     def set_aspirate_rate(self, rate=150, pipette=None):
-        """Set aspirate rate in uL/s. Default is 150 uL/s"""
+        """Set aspirate rate in uL/s for one mount, or for every loaded pipette if *pipette* is None.
+
+        The rate is kept until changed again or the pipette is reloaded.
+        """
         self.log_info(f"Setting aspirate rate to {rate} uL/s")
-
-        if pipette is None:
-            active_pipettes = self._get_active_pipettes()
-            if not active_pipettes:
-                self.log_warning("No loaded pipettes available to update aspirate rate")
-                return
-            for info in active_pipettes.values():
-                info["aspirate_flow_rate"] = rate
-            return
-
-        self._get_active_pipette_info(pipette)["aspirate_flow_rate"] = rate
+        self._set_flow_rate("aspirate", rate, pipette)
 
     def set_dispense_rate(self, rate=300, pipette=None):
-        """Set dispense rate in uL/s. Default is 300 uL/s"""
+        """Set dispense rate in uL/s for one mount, or for every loaded pipette if *pipette* is None.
+
+        The rate is kept until changed again or the pipette is reloaded.
+        """
         self.log_info(f"Setting dispense rate to {rate} uL/s")
+        self._set_flow_rate("dispense", rate, pipette)
 
+    def _set_flow_rate(self, action, rate, pipette=None):
         if pipette is None:
-            active_pipettes = self._get_active_pipettes()
-            if not active_pipettes:
-                self.log_warning("No loaded pipettes available to update dispense rate")
+            mounts = list(self._get_active_pipettes())
+            if not mounts:
+                self.log_warning(f"No loaded pipettes available to update {action} rate")
                 return
-            for info in active_pipettes.values():
-                info["dispense_flow_rate"] = rate
-            return
+        else:
+            mounts = [str(pipette).strip().lower()]
+            self._get_active_pipette_info(mounts[0])  # raises if not loaded
 
-        self._get_active_pipette_info(pipette)["dispense_flow_rate"] = rate
+        # Stored in config rather than pipette_info, which _update_pipettes()
+        # rebuilds from the robot before every transfer.
+        rates = copy.deepcopy(self.config.get("flow_rates", {}))
+        for mount in mounts:
+            rates.setdefault(mount, {})[action] = float(rate)
+        self.config["flow_rates"] = rates
+
+    def _flow_rate(self, mount, action):
+        """Return the flow rate in uL/s for *action* ("aspirate", "dispense" or
+        "blow_out") on *mount*: the rate set by the user, else the default."""
+        rate = self.config.get("flow_rates", {}).get(mount, {}).get(action)
+        if rate is not None:
+            return rate
+        return self._default_flow_rate(mount, action)
+
+    def _default_flow_rate(self, mount, action):
+        """Default rate when none has been set: the value the robot reports for
+        the pipette, falling back to 150 uL/s.  Blow out uses the dispense rate.
+
+        Override in subclasses that know the pipettes' default rates.
+        """
+        info = self.pipette_info.get(mount) or {}
+        key = "aspirate_flow_rate" if action == "aspirate" else "dispense_flow_rate"
+        return info.get(key, 150)
+
+    def _forget_flow_rates(self, mount):
+        """Drop user-set rates for *mount*, e.g. when a different pipette is loaded."""
+        rates = self.config.get("flow_rates", {})
+        if mount in rates:
+            self.config["flow_rates"] = {m: r for m, r in rates.items() if m != mount}
 
     def set_gantry_speed(self, speed=400):
         """Set movement speed of gantry. Default is 400 mm/s"""
@@ -2118,48 +2128,20 @@ class OT2HTTPDriver(OT2DeckWebAppMixin, Driver):
         return pipette
 
     def get_aspirate_rate(self, pipette=None):
-        """Get current aspirate rate for a pipette"""
-        active_pipettes = self._get_active_pipettes()
-        if pipette is None:
-            # Return the rate of the first pipette found
-            for mount, pipette_data in active_pipettes.items():
-                if pipette_data:
-                    pipette = mount
-                    break
-
-        if pipette is None:
-            return None
-
-        try:
-            for mount, pipette_data in active_pipettes.items():
-                if mount == pipette and pipette_data:
-                    return pipette_data.get("aspirate_flow_rate", 150)
-        except requests.exceptions.RequestException:
-            pass
-
-        return 150  # Default value
+        """Get current aspirate rate for a pipette (the first loaded one if None)"""
+        return self._get_rate("aspirate", pipette)
 
     def get_dispense_rate(self, pipette=None):
-        """Get current dispense rate for a pipette"""
+        """Get current dispense rate for a pipette (the first loaded one if None)"""
+        return self._get_rate("dispense", pipette)
+
+    def _get_rate(self, action, pipette=None):
         active_pipettes = self._get_active_pipettes()
         if pipette is None:
-            # Return the rate of the first pipette found
-            for mount, pipette_data in active_pipettes.items():
-                if pipette_data:
-                    pipette = mount
-                    break
-
-        if pipette is None:
+            pipette = next(iter(active_pipettes), None)
+        if pipette is None or pipette not in active_pipettes:
             return None
-
-        try:
-            for mount, pipette_data in active_pipettes.items():
-                if mount == pipette and pipette_data:
-                    return pipette_data.get("dispense_flow_rate", 300)
-        except requests.exceptions.RequestException:
-            pass
-
-        return 300  # Default value
+        return self._flow_rate(pipette, action)
 
     # HTTP API communication with heater-shaker module
     def set_shake(self, rpm, module_id = None):

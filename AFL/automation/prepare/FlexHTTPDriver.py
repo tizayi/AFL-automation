@@ -13,6 +13,8 @@ The Flex uses the same HTTP API base as the OT2 but with key differences:
   location at slot 12.
 """
 
+import re
+
 import requests
 
 from AFL.automation.APIServer.Driver import Driver
@@ -54,6 +56,30 @@ _NOZZLE_LAYOUT_CHANNELS = {"full96": 96, "column": 8, "single": 1}
 # addresses it as "left" mount, but storing it under a distinct key prevents
 # collision with an independent left-mount single-channel pipette.
 _96CH_MOUNT_KEY = "96channel"
+
+
+# Default flow rates in uL/s by (hardware pipette name, tip capacity in uL),
+# from https://docs.opentrons.com/python-api/pipettes/characteristics/.
+# The same rate is used to aspirate, dispense and blow out, except where
+# _FLEX_DEFAULT_BLOW_OUT_RATES says otherwise.
+_FLEX_DEFAULT_FLOW_RATES = {
+    ("p50_single_flex", 50): 35,
+    ("p50_multi_flex", 50): 35,
+    ("p1000_single_flex", 50): 478,
+    ("p1000_single_flex", 200): 716,
+    ("p1000_single_flex", 1000): 716,
+    ("p1000_multi_flex", 50): 478,
+    ("p1000_multi_flex", 200): 716,
+    ("p1000_multi_flex", 1000): 716,
+    ("p1000_96", 50): 6,
+    ("p1000_96", 200): 80,
+    ("p1000_96", 1000): 160,
+    ("p200_96", 50): 22,
+    ("p200_96", 200): 15,
+}
+_FLEX_DEFAULT_BLOW_OUT_RATES = {
+    ("p200_96", 200): 10,
+}
 
 
 def _is_96_channel(pipette_name):
@@ -105,6 +131,9 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
     # False when the deck has neither a trash bin nor a waste chute; transfer()
     # then refuses to start rather than failing at the tip drop.
     tip_disposal_available = True
+
+    # (pipette name, tip capacity) pairs already warned about having no default flow rate.
+    _warned_flow_rate_keys = set()
 
     # Pipette currently holding a tip (set on pickUpTip, cleared on dropTipInPlace),
     # and whether that tip must be discarded because the transfer using it failed.
@@ -406,6 +435,46 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         )
         self._execute_atomic_command("dropTipInPlace", {"pipetteId": pipette_id}, check_run_status=False)
         self.has_tip = False
+
+    def _default_flow_rate(self, mount, action):
+        """Opentrons' default rate for the pipette on *mount* and its tip size.
+
+        Falls back to OT2HTTPDriver's default (with a warning) for pipette/tip
+        combinations the table does not cover, such as the 8-channel EM pipette.
+        """
+        instrument = self.config.get("loaded_instruments", {}).get(mount, {})
+        name = instrument.get("name") or (self.pipette_info.get(mount) or {}).get("name")
+        key = (self._normalize_pipette_name(name), self._tip_capacity(mount))
+        rate = _FLEX_DEFAULT_FLOW_RATES.get(key)
+        if rate is None:
+            if key not in self._warned_flow_rate_keys:
+                self._warned_flow_rate_keys.add(key)
+                self.log_warning(
+                    f"No default flow rate for pipette {key[0]!r} with {key[1]} uL tips; "
+                    "using the robot-reported rate. Set one with set_aspirate_rate() "
+                    "and set_dispense_rate()."
+                )
+            return super()._default_flow_rate(mount, action)
+        if action == "blow_out":
+            return _FLEX_DEFAULT_BLOW_OUT_RATES.get(key, rate)
+        return rate
+
+    def _tip_capacity(self, mount):
+        """Return the tip capacity in uL of *mount*'s first tip rack, or None."""
+        instrument = self.config.get("loaded_instruments", {}).get(mount, {})
+        for rack_id in instrument.get("tip_racks", []):
+            slot = self._slot_by_labware_uuid(rack_id)
+            if slot is None:
+                continue
+            _, labware_name, labware_data = self.config["loaded_labware"][slot]
+            wells = ((labware_data or {}).get("definition") or {}).get("wells") or {}
+            volume = next(iter(wells.values()), {}).get("totalLiquidVolume")
+            if volume:
+                return int(volume)
+            match = re.search(r"(\d+)ul", str(labware_name).lower())
+            if match:
+                return int(match.group(1))
+        return None
 
     def _active_channels(self, pipette_id):
         """Return the number of active nozzles on the pipette with *pipette_id*."""
@@ -789,6 +858,8 @@ class FlexHTTPDriver(FlexDeckWebAppMixin, OT2HTTPDriver):
         for d in (self.config["loaded_instruments"], self.config["available_tips"], self.pipette_info):
             if "left" in d:
                 d[_96CH_MOUNT_KEY] = d.pop("left")
+        if not reload:
+            self._forget_flow_rates(_96CH_MOUNT_KEY)
         # Patch the 'mount' field inside pipette_info so get_pipette() returns it correctly.
         if _96CH_MOUNT_KEY in self.pipette_info and self.pipette_info[_96CH_MOUNT_KEY]:
             self.pipette_info[_96CH_MOUNT_KEY]["mount"] = _96CH_MOUNT_KEY

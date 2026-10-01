@@ -1679,3 +1679,73 @@ class TestTipStateSafeguards:
              pytest.raises(RuntimeError, match="tip"):
             driver._initialize_robot()
         home.assert_not_called()
+
+
+class TestFlexDefaultFlowRates:
+    def _driver(self, pipette, tiprack_name, tip_volume=None, mount="left"):
+        driver = StubFlexHTTPDriver()
+        wells = {"A1": {"totalLiquidVolume": tip_volume}} if tip_volume else {}
+        driver.config["loaded_labware"]["C2"] = (
+            "rack-1", tiprack_name, {"definition": {"wells": wells}},
+        )
+        driver.config["loaded_instruments"][mount] = {
+            "name": pipette, "pipette_id": "pid", "tip_racks": ["rack-1"],
+        }
+        driver.pipette_info = {mount: {"id": "pid", "name": pipette,
+                                       "aspirate_flow_rate": 150, "dispense_flow_rate": 150}}
+        return driver
+
+    @pytest.mark.parametrize("pipette, rack, tips, expected", [
+        ("p50_single_flex", "opentrons_flex_96_tiprack_50ul", 50, 35),
+        ("p1000_single_flex", "opentrons_flex_96_tiprack_50ul", 50, 478),
+        ("p1000_single_flex", "opentrons_flex_96_tiprack_200ul", 200, 716),
+        ("p1000_single_flex", "opentrons_flex_96_tiprack_1000ul", 1000, 716),
+        ("p1000_multi_flex", "opentrons_flex_96_tiprack_50ul", 50, 478),
+    ])
+    def test_defaults_follow_pipette_and_tip_size(self, pipette, rack, tips, expected):
+        driver = self._driver(pipette, rack, tips)
+        for action in ("aspirate", "dispense", "blow_out"):
+            assert driver._flow_rate("left", action) == expected
+
+    def test_96ch_defaults(self):
+        driver = self._driver("p1000_96", "opentrons_flex_96_tiprack_200ul", 200, mount=_96CH_MOUNT_KEY)
+        assert driver._flow_rate(_96CH_MOUNT_KEY, "aspirate") == 80
+
+    def test_96ch_200ul_blow_out_differs(self):
+        driver = self._driver("p200_96", "opentrons_flex_96_tiprack_200ul", 200, mount=_96CH_MOUNT_KEY)
+        assert driver._flow_rate(_96CH_MOUNT_KEY, "aspirate") == 15
+        assert driver._flow_rate(_96CH_MOUNT_KEY, "dispense") == 15
+        assert driver._flow_rate(_96CH_MOUNT_KEY, "blow_out") == 10
+
+    def test_tip_size_read_from_rack_name_when_definition_has_no_volume(self):
+        driver = self._driver("p1000_single_flex", "opentrons_flex_96_tiprack_50ul")
+        assert driver._flow_rate("left", "aspirate") == 478
+
+    def test_api_pipette_name_resolves(self):
+        driver = self._driver("flex_1channel_50", "opentrons_flex_96_tiprack_50ul", 50)
+        assert driver._flow_rate("left", "aspirate") == 35
+
+    def test_unknown_combination_falls_back_with_one_warning(self):
+        driver = self._driver("p1000_multi_em_flex", "opentrons_flex_96_tiprack_1000ul", 1000)
+        driver._warned_flow_rate_keys = set()
+        with patch.object(driver, "log_warning") as warn:
+            assert driver._flow_rate("left", "aspirate") == 150
+            assert driver._flow_rate("left", "dispense") == 150
+        warn.assert_called_once()
+
+    def test_user_rate_overrides_default(self):
+        driver = self._driver("p50_single_flex", "opentrons_flex_96_tiprack_50ul", 50)
+        driver.set_aspirate_rate(20, "left")
+        assert driver._flow_rate("left", "aspirate") == 20
+        assert driver._flow_rate("left", "dispense") == 35
+
+    def test_transfer_sends_default_rates(self):
+        driver = _configured_flex_driver()  # 50 uL pipette on left, 'tiprack-left' not on deck
+        driver.config["loaded_labware"]["C2"] = (
+            "tiprack-left", "opentrons_flex_96_tiprack_50ul",
+            {"definition": {"wells": {"A1": {"totalLiquidVolume": 50}}}},
+        )
+        driver.config["loaded_instruments"]["left"]["name"] = "p50_single_flex"
+        driver.transfer("1A1", "1A2", 30, blow_out=True)
+        rates = {c: p["flowRate"] for c, p in driver.executed_commands if "flowRate" in p}
+        assert rates == {"aspirate": 35, "dispense": 35, "blowout": 35}
